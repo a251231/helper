@@ -318,6 +318,381 @@ def _build_forwarded_xml(data: dict) -> str:
     )
 
 
+# ── WeChat 4.1 Native Voice (Type 34 SILK v3) Memory & SQLite pCache Extractor ──
+import ctypes as _ctypes
+from ctypes import wintypes as _wintypes
+import hashlib as _hashlib
+import io as _io
+import struct as _struct
+from collections import deque as _deque
+
+try:
+    import pysilk as _pysilk
+except Exception:
+    _pysilk = None
+
+from run_selftest import K as _K  # noqa: E402
+
+class _VoiceMBI(_ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", _ctypes.c_void_p),
+        ("AllocationBase", _ctypes.c_void_p),
+        ("AllocationProtect", _wintypes.DWORD),
+        ("PartitionId", _wintypes.WORD),
+        ("RegionSize", _ctypes.c_size_t),
+        ("State", _wintypes.DWORD),
+        ("Protect", _wintypes.DWORD),
+        ("Type", _wintypes.DWORD),
+    ]
+
+_K.VirtualQueryEx.argtypes = [_wintypes.HANDLE, _ctypes.c_void_p, _ctypes.POINTER(_VoiceMBI), _ctypes.c_size_t]
+_K.VirtualQueryEx.restype = _ctypes.c_size_t
+
+_voice_extract_lock = threading.Lock()
+_recent_voice_hashes: _deque[str] = _deque(maxlen=64)
+_cached_pcache_ptrs: dict[int, set[int]] = {}
+
+
+def _read_sqlite_varint(buf: bytes | bytearray, offset: int) -> tuple[int, int]:
+    v = 0
+    for i in range(9):
+        b = buf[offset + i]
+        if i == 8:
+            v = (v << 8) | b
+            return v, offset + 9
+        v = (v << 7) | (b & 0x7F)
+        if not (b & 0x80):
+            return v, offset + i + 1
+    return v, offset + 9
+
+
+def _sqlite_serial_size(st: int) -> int:
+    if st in (0, 8, 9):
+        return 0
+    if st == 1:
+        return 1
+    if st == 2:
+        return 2
+    if st == 3:
+        return 3
+    if st == 4:
+        return 4
+    if st == 5:
+        return 6
+    if st in (6, 7):
+        return 8
+    if st >= 12:
+        return (st - 12) // 2 if st % 2 == 0 else (st - 13) // 2
+    return 0
+
+
+def _walk_silk_frames(raw: bytes, idx: int, max_end: int, expected_len: int = 0) -> tuple[int, int, bool]:
+    off = idx + 10
+    frames = 0
+    while off + 2 <= max_end:
+        if expected_len > 0 and (off - idx) == expected_len:
+            return expected_len, frames, True
+        plen = raw[off] | (raw[off + 1] << 8)
+        if plen == 0xFFFF:
+            slen = off + 2 - idx
+            return slen, frames, (expected_len == 0 or abs(slen - expected_len) <= 4)
+        if plen <= 0 or plen > 250 or off + 2 + plen > max_end:
+            slen = off - idx
+            return slen, frames, (expected_len > 0 and abs(slen - expected_len) <= 4)
+        off += 2 + plen
+        frames += 1
+        if expected_len > 0 and (off - idx) == expected_len:
+            return expected_len, frames, True
+    return off - idx, frames, False
+
+
+def _scan_silk_from_wechat_mem(
+    pid: int,
+    *,
+    expected_len: int = 0,
+    target_msg_id: int = 0,
+    allow_seen: bool = False,
+) -> Optional[bytes]:
+    if pid <= 0:
+        return None
+    h_proc = _K.OpenProcess(0x0410, False, pid)
+    if not h_proc:
+        return None
+
+    def _read_mem(addr: int, size: int) -> bytes:
+        buf = _ctypes.create_string_buffer(size)
+        nread = _ctypes.c_size_t()
+        if _K.ReadProcessMemory(h_proc, _ctypes.c_void_p(addr), buf, size, _ctypes.byref(nread)) and nread.value > 0:
+            return buf.raw[: nread.value]
+        return b""
+
+    pcache_ptrs: set[int] = set(_cached_pcache_ptrs.get(pid, set()))
+    regions: list[tuple[int, bytes]] = []
+    contiguous_candidates: list[bytes] = []
+
+    try:
+        addr = 0
+        mbi = _VoiceMBI()
+        while _K.VirtualQueryEx(h_proc, _ctypes.c_void_p(addr), _ctypes.byref(mbi), _ctypes.sizeof(mbi)):
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize or 0
+            if mbi.State == 0x1000 and mbi.Type == 0x20000 and (mbi.Protect & 0x04) and 0 < size <= 64 * 1024 * 1024:
+                raw = _read_mem(base, size)
+                if raw:
+                    regions.append((base, raw))
+                    pos = 0
+                    while True:
+                        idx = raw.find(b"\x02#!SILK_V3", pos)
+                        if idx == -1:
+                            break
+                        max_end = min(len(raw), idx + max(expected_len + 64, 65536))
+                        slen, frames, exact = _walk_silk_frames(raw, idx, max_end, expected_len=expected_len)
+                        if frames >= 4 and exact:
+                            contiguous_candidates.append(raw[idx : idx + slen])
+
+                        start_scan = max(0, (idx - 4096) & ~7)
+                        end_scan = min(len(raw) - 0x1030, idx & ~7)
+                        for p_off in range(start_scan, end_scan + 8, 8):
+                            pbuf = _struct.unpack_from("<Q", raw, p_off + 0x1000)[0]
+                            if pbuf == base + p_off:
+                                pgno = _struct.unpack_from("<I", raw, p_off + 0x1010)[0]
+                                pcache = _struct.unpack_from("<Q", raw, p_off + 0x1020)[0]
+                                if 1 <= pgno <= 1000000 and pcache > 0x10000:
+                                    pcache_ptrs.add(pcache)
+                                break
+                        pos = idx + 10
+            addr = base + size
+            if addr >= 0x7FFFFFFFFFFF:
+                break
+    finally:
+        _K.CloseHandle(h_proc)
+
+    if pcache_ptrs:
+        _cached_pcache_ptrs[pid] = pcache_ptrs
+
+    U = 4016
+    max_local = U - 35
+    min_local = ((U - 12) * 32 // 255) - 23
+    sqlite_rows: list[tuple[int, int, int, int, bytes]] = []
+
+    for pcache_ptr in pcache_ptrs:
+        pcache_bytes = _struct.pack("<Q", pcache_ptr)
+        pages: dict[int, bytes] = {}
+        for base, raw in regions:
+            p = raw.find(pcache_bytes)
+            while p != -1:
+                if p >= 0x1020:
+                    pg_buf, _pg_hdr, pgno = _struct.unpack_from("<QQI", raw, p - 0x20)
+                    if pg_buf == (base + p - 0x1020) and 1 <= pgno <= 1000000:
+                        page_start = p - 0x1020
+                        pages[pgno] = raw[page_start : page_start + 4096]
+                p = raw.find(pcache_bytes, p + 8)
+
+        for pgno, page in pages.items():
+            if page[0] == 0x0D and b"\x02#!SILK_V3" in page:
+                num_cells = _struct.unpack_from(">H", page, 3)[0]
+                for c_idx in range(num_cells):
+                    if 8 + (c_idx + 1) * 2 > len(page):
+                        break
+                    cell_off = _struct.unpack_from(">H", page, 8 + c_idx * 2)[0]
+                    if cell_off >= U:
+                        continue
+                    try:
+                        P, off1 = _read_sqlite_varint(page, cell_off)
+                        rowid, rec_start = _read_sqlite_varint(page, off1)
+                        if P <= max_local:
+                            local_size = P
+                            ovf_pgno = 0
+                        else:
+                            surplus = min_local + (P - min_local) % (U - 4)
+                            local_size = surplus if surplus <= max_local else min_local
+                            if rec_start + local_size + 4 > U:
+                                continue
+                            ovf_pgno = _struct.unpack_from(">I", page, rec_start + local_size)[0]
+                        cell_payload = bytearray(page[rec_start : rec_start + local_size])
+                        cur_ovf = ovf_pgno
+                        missing_ovf = False
+                        hops = 0
+                        while cur_ovf != 0 and len(cell_payload) < P and hops < 64:
+                            hops += 1
+                            if cur_ovf not in pages:
+                                missing_ovf = True
+                                break
+                            ovf_page = pages[cur_ovf]
+                            next_ovf = _struct.unpack_from(">I", ovf_page, 0)[0]
+                            need = min(U - 4, P - len(cell_payload))
+                            cell_payload.extend(ovf_page[4 : 4 + need])
+                            cur_ovf = next_ovf
+                        if missing_ovf:
+                            continue
+                        hdr_size, h_off = _read_sqlite_varint(cell_payload, 0)
+                        serials: list[int] = []
+                        while h_off < hdr_size and h_off < len(cell_payload):
+                            st, h_off = _read_sqlite_varint(cell_payload, h_off)
+                            serials.append(st)
+                        val_off = hdr_size
+                        col_vals: list[int | None] = []
+                        silk_blob: Optional[bytes] = None
+                        for st in serials:
+                            sz = _sqlite_serial_size(st)
+                            if st == 8:
+                                col_vals.append(0)
+                            elif st == 9:
+                                col_vals.append(1)
+                            elif st in (1, 2, 3, 4, 5, 6):
+                                col_vals.append(
+                                    int.from_bytes(cell_payload[val_off : val_off + sz], "big", signed=True)
+                                    if sz > 0
+                                    else 0
+                                )
+                            elif st >= 12 and st % 2 == 0:
+                                blob = bytes(cell_payload[val_off : val_off + sz])
+                                col_vals.append(len(blob))
+                                if blob.startswith(b"\x02#!SILK_V3"):
+                                    silk_blob = blob
+                            else:
+                                col_vals.append(None)
+                            val_off += sz
+                        if silk_blob:
+                            raw_mid = col_vals[3] if len(col_vals) > 3 and isinstance(col_vals[3], int) else 0
+                            msg_svr_id = raw_mid & 0xFFFFFFFFFFFFFFFF
+                            create_time = col_vals[1] if len(col_vals) > 1 and isinstance(col_vals[1], int) else 0
+                            sqlite_rows.append((rowid, create_time, msg_svr_id, len(silk_blob), silk_blob))
+                    except Exception:
+                        continue
+
+    norm_tid = target_msg_id & 0xFFFFFFFFFFFFFFFF if target_msg_id else 0
+    sorted_rows = sorted(sqlite_rows, key=lambda x: (x[1], x[0]), reverse=True)
+
+    # Priority 1: Exact msg_svr_id match in media_0.db voice_data
+    if norm_tid:
+        for _rowid, _ctime, mid, _blen, blob in sorted_rows:
+            if mid == norm_tid:
+                return blob
+
+    # Priority 2: Exact length match in media_0.db voice_data (prefer unseen hash)
+    if expected_len > 0:
+        for _rowid, _ctime, _mid, blen, blob in sorted_rows:
+            if abs(blen - expected_len) <= 4:
+                h = _hashlib.md5(blob).hexdigest()
+                if allow_seen or h not in _recent_voice_hashes:
+                    return blob
+
+    # Priority 3: Contiguous heap SILK buffer matching expected_len
+    for blob in reversed(contiguous_candidates):
+        if expected_len <= 0 or abs(len(blob) - expected_len) <= 4:
+            h = _hashlib.md5(blob).hexdigest()
+            if allow_seen or h not in _recent_voice_hashes:
+                return blob
+
+    return None
+
+
+def _transcode_silk_bytes_to_mp3_b64(silk_bytes: bytes) -> str:
+    if not silk_bytes or _pysilk is None:
+        return ""
+    pcm_io = _io.BytesIO()
+    _pysilk.decode(_io.BytesIO(silk_bytes), pcm_io, 24000)
+    pcm_bytes = pcm_io.getvalue()
+    if not pcm_bytes:
+        return ""
+    ffmpeg_exe = None
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_exe = shutil.which("ffmpeg")
+    if not ffmpeg_exe:
+        return ""
+    proc = subprocess.run(
+        [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            "24000",
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-codec:a",
+            "libmp3lame",
+            "-qscale:a",
+            "4",
+            "-f",
+            "mp3",
+            "pipe:1",
+        ],
+        input=pcm_bytes,
+        capture_output=True,
+        timeout=12,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return ""
+    return base64.b64encode(proc.stdout).decode("ascii")
+
+
+def _extract_voice_xml_with_audio_b64(pid: int, voice_xml: str, data: dict) -> str:
+    if not voice_xml or 'audio_b64="' in voice_xml:
+        return voice_xml
+    expected_len = 0
+    m_len = re.search(r'\b(?:voicesize|length)\s*=\s*"(\d+)"', voice_xml)
+    if m_len:
+        try:
+            expected_len = int(m_len.group(1))
+        except Exception:
+            expected_len = 0
+    target_msg_id = 0
+    try:
+        target_msg_id = int(data.get("native_message_id") or 0)
+    except Exception:
+        target_msg_id = 0
+
+    with _voice_extract_lock:
+        time.sleep(0.25)
+        for attempt in range(7):
+            silk_bytes = _scan_silk_from_wechat_mem(
+                pid,
+                expected_len=expected_len,
+                target_msg_id=target_msg_id,
+                allow_seen=(attempt >= 5),
+            )
+            if silk_bytes:
+                try:
+                    b64 = _transcode_silk_bytes_to_mp3_b64(silk_bytes)
+                    if b64:
+                        _recent_voice_hashes.append(_hashlib.md5(silk_bytes).hexdigest())
+                        enriched = re.sub(
+                            r"<voicemsg\b",
+                            f'<voicemsg audio_b64="{b64}"',
+                            voice_xml,
+                            count=1,
+                        )
+                        logger.info(
+                            f"Extracted inbound V4 voice SILK ({len(silk_bytes)} bytes) -> "
+                            f"MP3 audio_b64 ({len(b64)} chars) on attempt {attempt + 1}"
+                        )
+                        return enriched
+                except Exception as e:
+                    logger.warning(f"Failed transcoding extracted SILK on attempt {attempt + 1}: {e}")
+            time.sleep(0.35)
+    logger.warning(f"Inbound V4 voice SILK not found in memory after retries (expected_len={expected_len}, msg_id={target_msg_id})")
+    return voice_xml
+
+
+async def _enrich_and_broadcast_voice(pid: int, payload: dict, voice_xml: str, data: dict) -> None:
+    try:
+        enriched = await asyncio.to_thread(_extract_voice_xml_with_audio_b64, pid, voice_xml, data)
+        if enriched:
+            payload["content"] = enriched
+    except Exception as e:
+        logger.warning(f"Error enriching V4 voice XML: {e}")
+    await _broadcast_ws(payload)
+
+
 def _on_native_message(pid: int, msg_type_code: int, data: dict, service: GatewayNativeTextService):
     """Callback invoked by NativeTextService for text, image, file, and forwarded events."""
     global _msg_count, _last_msg_summary
@@ -341,10 +716,13 @@ def _on_native_message(pid: int, msg_type_code: int, data: dict, service: Gatewa
         if is_group and not roomid:
             roomid = chat_id
 
-        raw_xml = str(data.get("raw_content") or "")
+        raw_msg_str = str(data.get("content") or data.get("msg") or "")
+        raw_xml = str(data.get("raw_content") or (raw_msg_str if raw_msg_str.lstrip().startswith("<") else ""))
         sender = str(data.get("sender_id") or data.get("from_wxid") or "").strip()
-        if not sender and raw_xml:
-            sender = _extract_xml_sender(raw_xml)
+        if (not sender or sender.endswith("@chatroom")) and raw_xml:
+            xml_sender = _extract_xml_sender(raw_xml)
+            if xml_sender:
+                sender = xml_sender
         if not sender and not is_group:
             sender = chat_id
 
@@ -479,7 +857,13 @@ def _on_native_message(pid: int, msg_type_code: int, data: dict, service: Gatewa
         logger.info(f"Inbound V4 msg #{_msg_count} (type={out_type}, is_at={is_at}): {_last_msg_summary}")
 
         if _main_loop and not _main_loop.is_closed():
-            asyncio.run_coroutine_threadsafe(_broadcast_ws(payload), _main_loop)
+            if wx_type == 34 and content.lstrip().startswith("<"):
+                asyncio.run_coroutine_threadsafe(
+                    _enrich_and_broadcast_voice(pid, payload, content, data),
+                    _main_loop,
+                )
+            else:
+                asyncio.run_coroutine_threadsafe(_broadcast_ws(payload), _main_loop)
     except Exception as e:
         logger.error(f"Error processing native V4 message: {e}", exc_info=True)
 
