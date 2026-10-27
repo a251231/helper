@@ -74,6 +74,20 @@ class GatewayNativeTextService(NativeTextService):
     """
 
     def _map_message(self, message):
+        if getattr(message, "type", 0) == 34:
+            voice_body = getattr(message, "image_xml", b"").decode("utf-8", errors="replace")
+            if voice_body.strip():
+                cache = getattr(self, "_voice_xml_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._voice_xml_cache = cache
+                msg_id_key = str(getattr(message, "native_message_id", 0) or "")
+                if msg_id_key:
+                    cache[msg_id_key] = voice_body
+                cache[f"seq:{getattr(message, 'sequence', 0)}"] = voice_body
+                while len(cache) > 256:
+                    cache.pop(next(iter(cache)), None)
+
         res = super()._map_message(message)
         if res is None and getattr(message, "type", 0) == 49:
             body = getattr(message, "image_xml", b"").decode("utf-8", errors="replace")
@@ -683,9 +697,44 @@ def _extract_voice_xml_with_audio_b64(pid: int, voice_xml: str, data: dict) -> s
     return voice_xml
 
 
+def _fast_transcode_voice_file(voice_path: str, voice_xml: str) -> str:
+    if not voice_path or not os.path.exists(voice_path):
+        return ""
+    with open(voice_path, "rb") as f:
+        silk_bytes = f.read()
+    if not silk_bytes:
+        return ""
+    b64 = _transcode_silk_bytes_to_mp3_b64(silk_bytes)
+    if not b64:
+        return ""
+    _recent_voice_hashes.append(_hashlib.md5(silk_bytes).hexdigest())
+    if "<voicemsg" in voice_xml:
+        enriched = re.sub(
+            r"<voicemsg\b",
+            f'<voicemsg audio_b64="{b64}"',
+            voice_xml,
+            count=1,
+        )
+    else:
+        enriched = f'<msg><voicemsg audio_b64="{b64}" length="{len(silk_bytes)}" /></msg>'
+    logger.info(
+        f"Fast-transcoded inbound V4 voice from VoiceReceiver ({len(silk_bytes)} bytes) -> "
+        f"MP3 audio_b64 ({len(b64)} chars)"
+    )
+    return enriched
+
+
 async def _enrich_and_broadcast_voice(pid: int, payload: dict, voice_xml: str, data: dict) -> None:
     try:
-        enriched = await asyncio.to_thread(_extract_voice_xml_with_audio_b64, pid, voice_xml, data)
+        enriched = ""
+        if data.get("voice_status") == "ready" and data.get("voice_path"):
+            enriched = await asyncio.to_thread(
+                _fast_transcode_voice_file,
+                str(data.get("voice_path")),
+                voice_xml,
+            )
+        if not enriched:
+            enriched = await asyncio.to_thread(_extract_voice_xml_with_audio_b64, pid, voice_xml, data)
         if enriched:
             payload["content"] = enriched
     except Exception as e:
@@ -706,8 +755,31 @@ def _on_native_message(pid: int, msg_type_code: int, data: dict, service: Gatewa
             return
 
         wx_type = int(data.get("wx_type") or 1)
-        # Skip pure system / recall / friend-request events that aren't chat messages
+        # Skip pure system / recall / friend-request events that aren't chat messages,
+        # while refreshing group member cache on group system events.
         if wx_type in (37, 10000, 10002):
+            if wx_type in (10000, 10002):
+                sys_room = str(data.get("room_wxid") or data.get("chat_id") or "")
+                if sys_room.endswith("@chatroom"):
+                    _room_members_cache.pop(sys_room, None)
+                    if wx_type == 10000 and data.get("system_content"):
+                        try:
+                            from wxbot_framework.group_events import parse_group_system_message
+
+                            evt = parse_group_system_message(
+                                str(data.get("system_content") or ""),
+                                chat_id=sys_room,
+                            )
+                            if evt is not None:
+                                logger.info(
+                                    f"Group membership event in {sys_room}: {evt.event} "
+                                    f"({len(evt.members)} members), invalidated member cache"
+                                )
+                        except Exception:
+                            pass
+            return
+
+        if wx_type == 34 and data.get("voice_status") == "pending":
             return
 
         roomid = str(data.get("room_wxid") or "")
@@ -718,6 +790,19 @@ def _on_native_message(pid: int, msg_type_code: int, data: dict, service: Gatewa
 
         raw_msg_str = str(data.get("content") or data.get("msg") or "")
         raw_xml = str(data.get("raw_content") or (raw_msg_str if raw_msg_str.lstrip().startswith("<") else ""))
+        if wx_type == 34 and not raw_xml:
+            v_cache = getattr(service, "_voice_xml_cache", None) or {}
+            v_mid = str(data.get("native_message_id") or "")
+            cached_xml = (v_cache.get(v_mid) if v_mid else None) or v_cache.get(
+                f"seq:{data.get('sequence') or 0}"
+            )
+            if cached_xml:
+                raw_xml = str(cached_xml)
+            if not raw_xml:
+                v_dur = int(data.get("voice_duration_ms") or 0)
+                v_sz = int(data.get("voice_size") or 0)
+                v_from = html.escape(str(data.get("sender_id") or data.get("from_wxid") or ""))
+                raw_xml = f'<msg><voicemsg voicelength="{v_dur}" length="{v_sz}" fromusername="{v_from}" /></msg>'
         sender = str(data.get("sender_id") or data.get("from_wxid") or "").strip()
         if (not sender or sender.endswith("@chatroom")) and raw_xml:
             xml_sender = _extract_xml_sender(raw_xml)
@@ -1579,6 +1664,47 @@ async def api_send_moment(req: SendMomentRequest):
                 tf.unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+@app.get("/api/moments")
+async def api_moments(limit: int = 20):
+    """Read loaded WeChat 4.1 Moments feed from PC memory cache."""
+    svc = _svc
+    if not _is_service_active(svc):
+        return JSONResponse(
+            {"status": -1, "code": "not_connected", "rows": [], "message": "WeChat 4.1 is not connected"},
+            status_code=503,
+        )
+    clamped_limit = max(1, min(int(limit or 20), 100))
+    try:
+        from wxbot_framework.moments_reader import MomentsReadError
+    except Exception:
+        MomentsReadError = RuntimeError  # type: ignore
+
+    try:
+        res = await asyncio.to_thread(svc.read_moments, clamped_limit)
+        rows = res.get("rows", []) if isinstance(res, dict) else []
+        return {
+            "status": 0,
+            "source": res.get("source", "loaded_pc_moments_cache") if isinstance(res, dict) else "loaded_pc_moments_cache",
+            "loaded_count": res.get("loaded_count", len(rows)) if isinstance(res, dict) else len(rows),
+            "truncated": bool(res.get("truncated", False)) if isinstance(res, dict) else False,
+            "rows": rows,
+        }
+    except MomentsReadError as e:
+        logger.info(f"V4 /api/moments not ready: {e}")
+        return {
+            "status": -1,
+            "code": "moments_not_loaded",
+            "rows": [],
+            "message": str(e),
+        }
+    except Exception as e:
+        logger.warning(f"Error in V4 /api/moments: {e}")
+        return JSONResponse(
+            {"status": -1, "code": "error", "rows": [], "message": str(e)},
+            status_code=500,
+        )
 
 
 @app.get("/api/contacts")
