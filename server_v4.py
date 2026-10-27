@@ -142,6 +142,101 @@ _contact_name_cache: dict[str, str] = {}
 _self_profile_cache: dict[str, str] = {}
 _CACHE_TTL = 300.0  # 5 minutes
 
+# ── Friend Request Auto-Accept State ─────────────────────────────────
+_auto_accept_friend: bool = os.environ.get("WCF_AUTO_ACCEPT_FRIEND", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+_auto_accept_keywords: list[str] = [
+    k.strip() for k in os.environ.get("WCF_AUTO_ACCEPT_KEYWORDS", "").split(",") if k.strip()
+][:32]
+_recent_friend_events: dict[str, dict] = {}
+_friend_events_lock = threading.Lock()
+
+
+def _record_or_update_friend_event(
+    freq: dict,
+    *,
+    status: Optional[str] = None,
+    accepted_at: Optional[int] = None,
+    sender_id: Optional[str] = None,
+) -> dict:
+    req_id = str(freq.get("request_id") or "").strip()
+    if not req_id:
+        return {}
+    now_ts = int(time.time())
+    with _friend_events_lock:
+        existing = _recent_friend_events.get(req_id) or {}
+        merged = {
+            "request_id": req_id,
+            "sender_id": str(sender_id or freq.get("sender_id") or existing.get("sender_id") or "").strip(),
+            "nickname": str(freq.get("nickname") or existing.get("nickname") or "").strip(),
+            "verification": str(freq.get("verification") or existing.get("verification") or "").strip(),
+            "scene": int(freq.get("scene") if freq.get("scene") is not None else existing.get("scene") or 0),
+            "opcode": int(freq.get("opcode") if freq.get("opcode") is not None else existing.get("opcode") or 2),
+            "status": str(status or freq.get("status") or existing.get("status") or "pending"),
+            "error": str(freq.get("error") or existing.get("error") or ""),
+            "ts": int(existing.get("ts") or now_ts),
+            "accepted_at": int(
+                accepted_at if accepted_at is not None else (existing.get("accepted_at") or 0)
+            ),
+        }
+        _recent_friend_events[req_id] = merged
+        while len(_recent_friend_events) > 100:
+            _recent_friend_events.pop(next(iter(_recent_friend_events)), None)
+        return dict(merged)
+
+
+def _resolve_wxid_by_nickname(service: GatewayNativeTextService, nickname: str) -> str:
+    nick = (nickname or "").strip()
+    if not nick:
+        return ""
+    try:
+        snapshot = service.contacts()
+        raw_items = snapshot.get("contacts", []) if isinstance(snapshot, dict) else []
+        matches = [
+            str(c.get("wxid") or "").strip()
+            for c in raw_items
+            if isinstance(c, dict)
+            and str(c.get("wxid") or "").strip()
+            and (c.get("nickname") == nick or c.get("display_name") == nick)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    except Exception:
+        pass
+    return ""
+
+
+async def _auto_accept_friend_task(service: GatewayNativeTextService, freq: dict) -> None:
+    req_id = str(freq.get("request_id") or "").strip()
+    if not req_id:
+        return
+    await asyncio.sleep(1.5)
+    try:
+        ok = await asyncio.to_thread(service.accept_friend, req_id)
+        resolved_wxid = str(freq.get("sender_id") or "").strip()
+        if ok and not resolved_wxid and freq.get("nickname"):
+            await asyncio.sleep(1.0)
+            resolved_wxid = await asyncio.to_thread(
+                _resolve_wxid_by_nickname, service, str(freq.get("nickname") or "")
+            )
+        _record_or_update_friend_event(
+            freq,
+            status="accepted" if ok else "failed",
+            accepted_at=int(time.time()) if ok else 0,
+            sender_id=resolved_wxid or None,
+        )
+        logger.info(
+            f"Auto-accept V4 friend request finished: id={req_id}, "
+            f"nickname={freq.get('nickname')}, sender_id={resolved_wxid}, ok={ok}"
+        )
+    except Exception as e:
+        _record_or_update_friend_event(freq, status="failed")
+        logger.warning(f"Auto-accept V4 friend request failed (id={req_id}): {e}")
+
 
 def _is_service_active(svc: Optional[GatewayNativeTextService]) -> bool:
     if svc is None:
@@ -755,10 +850,29 @@ def _on_native_message(pid: int, msg_type_code: int, data: dict, service: Gatewa
             return
 
         wx_type = int(data.get("wx_type") or 1)
-        # Skip pure system / recall / friend-request events that aren't chat messages,
-        # while refreshing group member cache on group system events.
+        # Handle real-time Friend Request events (wx_type == 37) and Group System / Recall events
         if wx_type in (37, 10000, 10002):
-            if wx_type in (10000, 10002):
+            if wx_type == 37:
+                freq = data.get("friend_request")
+                if isinstance(freq, dict) and freq.get("request_id"):
+                    _record_or_update_friend_event(freq)
+                    req_id = str(freq.get("request_id") or "")
+                    nick = str(freq.get("nickname") or "")
+                    verif = str(freq.get("verification") or "")
+                    logger.info(
+                        f"Inbound V4 friend request: id={req_id}, sender={freq.get('sender_id')}, "
+                        f"nickname={nick}, status={freq.get('status')}, auto_accept={_auto_accept_friend}"
+                    )
+                    if _auto_accept_friend and freq.get("status") == "pending":
+                        kw_match = not _auto_accept_keywords or any(
+                            kw in verif for kw in _auto_accept_keywords
+                        )
+                        if kw_match and _main_loop and not _main_loop.is_closed():
+                            asyncio.run_coroutine_threadsafe(
+                                _auto_accept_friend_task(service, dict(freq)),
+                                _main_loop,
+                            )
+            elif wx_type in (10000, 10002):
                 sys_room = str(data.get("room_wxid") or data.get("chat_id") or "")
                 if sys_room.endswith("@chatroom"):
                     _room_members_cache.pop(sys_room, None)
@@ -1284,6 +1398,15 @@ class InteractMomentReq(BaseModel):
     content: str = ""
 
 
+class AcceptFriendReq(BaseModel):
+    request_id: str
+
+
+class FriendAutoAcceptReq(BaseModel):
+    enabled: bool = True
+    keywords: Optional[list[str]] = None
+
+
 # ── HTTP & WebSocket Endpoints ───────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -1364,6 +1487,8 @@ async def api_status():
         "ws_clients": len(_ws_clients),
         "engine": "v4",
         "moments_interaction_supported": True,
+        "friend_request_supported": True,
+        "auto_accept_friend": _auto_accept_friend,
     }
 
 
@@ -1774,6 +1899,140 @@ async def api_interact_moment(req: InteractMomentReq):
             {"status": -1, "code": "error", "message": str(e)},
             status_code=500,
         )
+
+
+@app.get("/api/friend_requests")
+async def api_friend_requests():
+    """Return pending and recently processed friend requests along with auto-accept configuration."""
+    svc = _svc
+    if not _is_service_active(svc):
+        return JSONResponse(
+            {
+                "status": -1,
+                "auto_accept": _auto_accept_friend,
+                "keywords": list(_auto_accept_keywords),
+                "requests": [],
+                "message": "WeChat 4.1 is not connected",
+            },
+            status_code=503,
+        )
+    try:
+        raw_reqs = await asyncio.to_thread(svc.friend_requests)
+        merged_list: list[dict] = []
+        seen_ids: set[str] = set()
+        for item in raw_reqs or []:
+            if not isinstance(item, dict):
+                continue
+            merged = _record_or_update_friend_event(item)
+            if merged:
+                seen_ids.add(merged["request_id"])
+                merged_list.append(merged)
+        with _friend_events_lock:
+            for req_id, ev in _recent_friend_events.items():
+                if req_id not in seen_ids:
+                    merged_list.append(dict(ev))
+        merged_list.sort(key=lambda r: int(r.get("ts") or 0), reverse=True)
+        return {
+            "status": 0,
+            "auto_accept": _auto_accept_friend,
+            "keywords": list(_auto_accept_keywords),
+            "requests": merged_list[:50],
+        }
+    except Exception as e:
+        logger.warning(f"Error in V4 /api/friend_requests: {e}")
+        return JSONResponse(
+            {
+                "status": -1,
+                "auto_accept": _auto_accept_friend,
+                "keywords": list(_auto_accept_keywords),
+                "requests": [],
+                "message": str(e),
+            },
+            status_code=500,
+        )
+
+
+@app.post("/api/accept_friend")
+async def api_accept_friend(req: AcceptFriendReq):
+    """Accept a pending WeChat 4.1 friend request by request_id (fr_...)."""
+    svc = _svc
+    if not _is_service_active(svc):
+        return JSONResponse(
+            {"status": -1, "accepted": False, "message": "WeChat 4.1 is not connected"},
+            status_code=503,
+        )
+    req_id = (req.request_id or "").strip()
+    if not re.fullmatch(r"^fr_[0-9a-f]{32}$", req_id):
+        return JSONResponse(
+            {"status": -1, "accepted": False, "message": "Invalid request_id format"},
+            status_code=400,
+        )
+    try:
+        ok = await asyncio.to_thread(svc.accept_friend, req_id)
+        with _friend_events_lock:
+            existing = dict(_recent_friend_events.get(req_id) or {"request_id": req_id})
+        resolved_wxid = str(existing.get("sender_id") or "").strip()
+        if ok and not resolved_wxid and existing.get("nickname"):
+            await asyncio.sleep(0.8)
+            resolved_wxid = await asyncio.to_thread(
+                _resolve_wxid_by_nickname, svc, str(existing.get("nickname") or "")
+            )
+        updated = _record_or_update_friend_event(
+            existing,
+            status="accepted" if ok else "failed",
+            accepted_at=int(time.time()) if ok else 0,
+            sender_id=resolved_wxid or None,
+        )
+        logger.info(f"Manual/API accept_friend: id={req_id}, ok={ok}, sender_id={resolved_wxid}")
+        return {
+            "status": 0 if ok else -1,
+            "accepted": bool(ok),
+            "request_id": req_id,
+            "sender_id": updated.get("sender_id", ""),
+            "nickname": updated.get("nickname", ""),
+            "message": "ok" if ok else "accept_friend returned False",
+        }
+    except Exception as e:
+        logger.warning(f"Error in V4 /api/accept_friend (id={req_id}): {e}")
+        return JSONResponse(
+            {"status": -1, "accepted": False, "request_id": req_id, "message": str(e)},
+            status_code=400,
+        )
+
+
+@app.post("/api/friend_auto_accept")
+async def api_friend_auto_accept(req: FriendAutoAcceptReq):
+    """Update gateway-level automatic friend request acceptance and optional verification keywords."""
+    global _auto_accept_friend, _auto_accept_keywords
+    _auto_accept_friend = bool(req.enabled)
+    if req.keywords is not None:
+        _auto_accept_keywords = [
+            str(k).strip()[:128] for k in req.keywords if str(k).strip()
+        ][:32]
+    logger.info(
+        f"Updated friend auto-accept config: enabled={_auto_accept_friend}, keywords={_auto_accept_keywords}"
+    )
+
+    svc = _svc
+    triggered = 0
+    if _auto_accept_friend and _is_service_active(svc):
+        try:
+            raw_reqs = await asyncio.to_thread(svc.friend_requests)
+            for item in raw_reqs or []:
+                if isinstance(item, dict) and item.get("status") == "pending" and item.get("request_id"):
+                    verif = str(item.get("verification") or "")
+                    if not _auto_accept_keywords or any(kw in verif for kw in _auto_accept_keywords):
+                        asyncio.create_task(_auto_accept_friend_task(svc, dict(item)))
+                        triggered += 1
+        except Exception:
+            pass
+
+    return {
+        "status": 0,
+        "auto_accept": _auto_accept_friend,
+        "keywords": list(_auto_accept_keywords),
+        "triggered_pending": triggered,
+    }
 
 
 @app.get("/api/contacts")
