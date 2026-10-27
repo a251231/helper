@@ -1278,6 +1278,12 @@ class SendMomentRequest(BaseModel):
     visibility: str = "public"
 
 
+class InteractMomentReq(BaseModel):
+    sns_id: str
+    action: str = "like"  # "like" or "comment"
+    content: str = ""
+
+
 # ── HTTP & WebSocket Endpoints ───────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -1357,6 +1363,7 @@ async def api_status():
         "last_msg": _last_msg_summary,
         "ws_clients": len(_ws_clients),
         "engine": "v4",
+        "moments_interaction_supported": True,
     }
 
 
@@ -1675,7 +1682,7 @@ async def api_moments(limit: int = 20):
             {"status": -1, "code": "not_connected", "rows": [], "message": "WeChat 4.1 is not connected"},
             status_code=503,
         )
-    clamped_limit = max(1, min(int(limit or 20), 100))
+    clamped_limit = max(1, min(int(limit or 20), 50))
     try:
         from wxbot_framework.moments_reader import MomentsReadError
     except Exception:
@@ -1703,6 +1710,68 @@ async def api_moments(limit: int = 20):
         logger.warning(f"Error in V4 /api/moments: {e}")
         return JSONResponse(
             {"status": -1, "code": "error", "rows": [], "message": str(e)},
+            status_code=500,
+        )
+
+
+@app.post("/api/interact_moment")
+async def api_interact_moment(req: InteractMomentReq):
+    """Like or comment on a loaded WeChat 4.1 Moment post by sns_id."""
+    svc = _svc
+    if not _is_service_active(svc):
+        return JSONResponse(
+            {"status": -1, "code": "not_connected", "message": "WeChat 4.1 is not connected"},
+            status_code=503,
+        )
+
+    sns_id = (req.sns_id or "").strip()
+    if not re.fullmatch(r"^[1-9][0-9]{0,19}$", sns_id) or int(sns_id) > 0xFFFFFFFFFFFFFFFF:
+        return JSONResponse(
+            {"status": -1, "code": "invalid_sns_id", "message": "Invalid sns_id"},
+            status_code=400,
+        )
+
+    action = (req.action or "").strip().lower()
+    if action not in ("like", "comment"):
+        return JSONResponse(
+            {"status": -1, "code": "invalid_action", "message": "action must be 'like' or 'comment'"},
+            status_code=400,
+        )
+
+    if action == "like":
+        content_str = ""
+    else:
+        content_str = (req.content or "").strip()
+        if not content_str or "\0" in content_str or len(content_str.encode("utf-8")) > 1023:
+            return JSONResponse(
+                {
+                    "status": -1,
+                    "code": "invalid_content",
+                    "message": "comment content must be non-empty and <= 1023 UTF-8 bytes",
+                },
+                status_code=400,
+            )
+
+    try:
+        res = await asyncio.to_thread(
+            svc.interact_moments,
+            {"sns_id": sns_id, "action": action, "content": content_str},
+        )
+        status_str = res.get("status", "") if isinstance(res, dict) else ""
+        ok = status_str in ("completed", "already_liked")
+        logger.info(
+            f"Interacted with V4 WeChat Moment (sns_id={sns_id}, action={action}, status={status_str})"
+        )
+        return {
+            "status": 0 if ok else -1,
+            "code": status_str or "failed",
+            "result": res,
+            "message": "ok" if ok else f"interact_moments status={status_str}",
+        }
+    except Exception as e:
+        logger.error(f"Error interacting with V4 moment: {e}", exc_info=True)
+        return JSONResponse(
+            {"status": -1, "code": "error", "message": str(e)},
             status_code=500,
         )
 

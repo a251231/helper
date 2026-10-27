@@ -67,7 +67,8 @@ python server_v4.py
 | `/api/send_image` | `POST` | 发送图片（检测到 `.gif` 时自动优先以 **Type 47 原生微信动画表情包** 发送） |
 | `/api/send_voice` | `POST` | 发送 **Type 34 原生微信语音条 (SILK v3)**，支持 `.mp3` / `.wav` 自动转码为 24kHz 单声道 PCM |
 | `/api/send_moment` | `POST` | 发布真实 **微信朋友圈 (Moments)**，支持纯文本或最多 9 张图文动态 |
-| /api/moments | GET | 读取电脑微信已加载的 **朋友圈动态列表**（limit=1..100） |
+| `/api/moments` | `GET` | 读取电脑微信已加载的 **朋友圈动态列表**（`limit=1..50`，含 `raw_like_flag`、`likes`、`likes_total`、`comments`、`comments_total`） |
+| `/api/interact_moment` | `POST` | 对已加载的微信 4.1 朋友圈动态执行 **原生点赞 (`action="like"`) 或文字评论 (`action="comment"`)** |
 | `/api/send_file` | `POST` | 发送任意文件（支持本地路径、URL、Base64 与自定义文件名） |
 | `/api/contacts` | `GET` | 读取当前登录微信内存联系人列表 |
 | `/api/chatroom_members` | `GET` | 读取指定群聊 (`roomid`) 成员 `{wxid: display_name}` 映射 |
