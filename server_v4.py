@@ -302,15 +302,21 @@ def _get_room_members(roomid: str) -> dict[str, str]:
             wxid = row.get("wxid", "")
             if not wxid:
                 continue
-            dname = (
+            raw_dname = str(
                 row.get("display_name")
                 or row.get("room_nickname")
                 or row.get("nickname")
-                or wxid
+                or ""
+            ).strip()
+            dname = (
+                raw_dname
+                if (raw_dname and raw_dname != wxid and not raw_dname.lower().startswith("wxid_"))
+                else ""
             )
             members[wxid] = dname
-            if row.get("nickname"):
-                _contact_name_cache[wxid] = row["nickname"]
+            nick_val = str(row.get("nickname") or "").strip()
+            if nick_val and nick_val != wxid and not nick_val.lower().startswith("wxid_"):
+                _contact_name_cache[wxid] = nick_val
         _room_members_cache[roomid] = (now, members)
         return members
     except Exception as e:
@@ -329,27 +335,35 @@ def _resolve_sender_name(
     """Resolve human-readable display name for a sender."""
     if not sender:
         return ""
-    if fallback_name and fallback_name != sender:
+    if fallback_name and fallback_name != sender and not fallback_name.lower().startswith("wxid_"):
         _contact_name_cache[sender] = fallback_name
     if roomid:
         cached_room = _room_members_cache.get(roomid)
-        if cached_room and sender in cached_room[1] and cached_room[1][sender]:
-            return cached_room[1][sender]
+        if cached_room and sender in cached_room[1]:
+            c_name = str(cached_room[1][sender] or "").strip()
+            if c_name and c_name != sender and not c_name.lower().startswith("wxid_"):
+                return c_name
         if not fast_only:
             members = _get_room_members(roomid)
-            if sender in members and members[sender]:
-                return members[sender]
-    if fallback_name:
+            if sender in members:
+                m_name = str(members[sender] or "").strip()
+                if m_name and m_name != sender and not m_name.lower().startswith("wxid_"):
+                    return m_name
+    if fallback_name and fallback_name != sender and not fallback_name.lower().startswith("wxid_"):
         return fallback_name
     if sender in _contact_name_cache:
-        return _contact_name_cache[sender]
+        c_val = str(_contact_name_cache[sender] or "").strip()
+        if c_val and c_val != sender and not c_val.lower().startswith("wxid_"):
+            return c_val
     if not fast_only:
         svc = _svc
         if _is_service_active(svc):
             try:
-                name = svc._sender_wechat_name(sender)
-                if name:
+                name = str(svc._sender_wechat_name(sender) or "").strip()
+                if name and name != sender and not name.lower().startswith("wxid_"):
                     _contact_name_cache[sender] = name
+                    if roomid and roomid in _room_members_cache:
+                        _room_members_cache[roomid][1][sender] = name
                     return name
             except Exception:
                 pass
@@ -1507,7 +1521,12 @@ async def api_send(req: SendTextRequest):
                 prefix_parts: list[str] = []
                 for wxid in at_list:
                     dname = _resolve_sender_name(wxid, req.receiver)
-                    if f"@{dname}" not in msg_text:
+                    if (
+                        dname
+                        and dname != wxid
+                        and not dname.lower().startswith("wxid_")
+                        and f"@{dname}" not in msg_text
+                    ):
                         prefix_parts.append(f"@{dname}\u2005")
                 if prefix_parts:
                     msg_text = "".join(prefix_parts) + msg_text
