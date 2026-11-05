@@ -15,6 +15,18 @@
       "architecture": "x64",
       "size": 204305968,
       "sha256": "e0428a7b691853de496532523c2c09aa095f90941c37c9f4cfb3f137f3c66556"
+    },
+    {
+      "wechat_version": "4.2.0.11",
+      "architecture": "x64",
+      "size": 205929008,
+      "sha256": "745cdf2955fa5128cdb00c056c97571156a5f107406a9bb15ac0754f3246b201"
+    },
+    {
+      "wechat_version": "4.2.0.12",
+      "architecture": "x64",
+      "size": 205932072,
+      "sha256": "2b3677c3f932daaa4ef84c8b2acd0aee12cbe5a779ff9e740c370761e5c291ce"
     }
   ]
 }

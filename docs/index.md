@@ -22,6 +22,10 @@ hero:
       text: GitHub 仓库
       link: https://github.com/Prometheus-first/helper
 features:
+  - icon: 📰
+    title: 公众号文章
+    details: 自动读取已关注公众号，点击公众号分页同步文章，在网页阅读正文和图片并导出 Markdown。
+    link: /guide/web-panel#公众号文章
   - icon: 📷
     title: 朋友圈
     details: 发布文字和图文，读取已加载记录及互动，手动点赞或评论。
@@ -72,7 +76,7 @@ features:
 
 ## 先了解运行条件
 
-helper 目前适配 **Windows x64、微信 4.1.15.13 / 4.1.15.56**，使用 Python 作为插件入口、原生桥接负责消息能力。版本和核心 DLL 指纹均有检查，按构建选择对应地址；其他微信版本需要重新适配。
+helper 目前适配 **Windows x64、微信 4.1.15.13 / 4.1.15.56 / 4.2.0.11 / 4.2.0.12** 的指定构建，使用 Python 作为插件入口、原生桥接负责消息能力。4.2.0.11 和 4.2.0.12 的部分接口仍未开放，详见[常见问题](./guide/faq.md#微信版本不匹配怎么办)。版本和核心 DLL 指纹均有检查，按构建选择对应地址；其他微信版本需要重新适配。
 
 ```powershell
 python -m pip install -r requirements.txt

@@ -48,7 +48,10 @@ assert MomentsConfig.image_paths.offset == 1704 and MomentsConfig.text.offset ==
 
 
 def _native():
-    import run_selftest
+    if __package__:
+        from . import run_selftest
+    else:
+        import run_selftest
     return run_selftest
 
 
@@ -100,7 +103,7 @@ def _core_profile(path):
         for chunk in iter(lambda: source.read(1024 * 1024), b''):
             digest.update(chunk)
     profile = profile_for_fingerprint(path.stat().st_size, digest.hexdigest())
-    return profile if profile is not None and profile.version == '4.1.15.56' else None
+    return profile if profile is not None and profile.version in ('4.1.15.56', '4.2.0.11', '4.2.0.12') else None
 
 
 def moments_capabilities(pid=None, bridge_path=TEXT_DLL, *, core_path=None):

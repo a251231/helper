@@ -11,8 +11,10 @@ Windows 微信机器人 Python 插件框架，提供本地网页管理台、控�
 - 多账号管理：发现已登录微信，按账号启停，独立保存插件配置与数据。
 - 联系人：扫描当前账号的好友，搜索及按标签筛选，查看昵称、备注、微信号、地区和签名。
 - 朋友圈：发布文字和图片，读取已加载记录、点赞人和评论，手动点赞或发送评论。
+- 公众号文章：自动获取当前账号的关注公众号，点击公众号自动分页同步它的文章，点击文章自动加载正文和图片，按账号保存并导出 Markdown；目前支持已核对的微信 4.2.0.12
 - 消息收发：文本自动分段，图片、文件、表情包、语音条，支持真实群艾特与群成员身份查询；普通文件按块处理。
 - 消息监控：显示时间、会话 ID、发送者及正文，展开合并转发记录，保留撤回标记。
+- 定时任务：按间隔或每天指定时间执行文字发送和插件提供的动作，支持多账号独立管理。
 - 群聊管理：群聊备注、进退群通知、成员昵称绑定、聊天总结、人格切换、成语游戏和图库取图。
 - 模型与语音：支持 OpenAI 兼容的 Chat Completions API、Fish Audio 合成和按群切换音色。
 - 插件二开：在网页修改业务函数与配置，保存生效，支持恢复默认代码和配置。
@@ -25,7 +27,11 @@ Windows 微信机器人 Python 插件框架，提供本地网页管理台、控�
 
 运行条件：Windows 10/11 x64、64 位 Python（已验证 3.11 / 3.13）、Microsoft Visual C++ x64 运行库。
 
-**当前适配微信 4.1.15.13 / 4.1.15.56 的指定构建。** 程序按核心 DLL 指纹校验，未知构建会拒绝加载。日常使用仓库内的两个桥接 DLL，无需 Visual Studio、Ghidra 或重新编译。各接口的实测范围见 [native/README.md](native/README.md)。
+当前适配微信 4.2.0.12 的指定构建。
+
+4.2.0.12 已实测账号与二维码识别、文本及群艾特、图片、文件和语音收发、撤回补发、好友申请、进退群事件、朋友圈读取与仅自己可见的发布，以及公众号目录、分页和正文读取。公众号图片显示尚未单独实测。
+
+各版本的详细范围见 [native/README.md](native/README.md)。
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -92,6 +98,7 @@ python server_v4.py
 | 安装、选择账号、添加群 | [快速开始](docs/guide/quick-start.md) · [账号与群聊](docs/guide/account-and-groups.md) |
 | 启停账号、监控消息、修改插件 | [网页管理台](docs/guide/web-panel.md) |
 | 扫描好友、查看资料和标签 | [扫描联系人](docs/guide/web-panel.md#扫描联系人) |
+| 关注公众号、自动同步文章和站内阅读 | [公众号文章](docs/guide/web-panel.md#公众号文章) |
 | 图片、文件、表情和语音 | [图片](docs/messages/images.md) · [文件](docs/messages/files.md) · [表情](docs/messages/emoticons.md) · [语音](docs/messages/voice.md) |
 | 合并转发与防撤回 | [合并转发](docs/messages/forwarded.md) · [防撤回](docs/messages/recall.md) |
 | 好友申请、群成员与群管理 | [好友申请与群管理](docs/guide/friends-and-groups.md) |
@@ -116,8 +123,8 @@ tools/                配置初始化、测试与发布检查
 
 <details>
 <summary>交流群二维码</summary>
+<img width="630" height="952" alt="image" src="https://github.com/user-attachments/assets/8da68736-0327-44f2-9149-0219b079da8b" />
 
-<img width="630" height="952" alt="image" src="https://github.com/user-attachments/assets/cd2e28c8-e353-4c90-b425-5ddcf491ddc4" />
 
 
 </details>
