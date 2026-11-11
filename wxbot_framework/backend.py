@@ -19,7 +19,7 @@ TEXT_CAPABILITIES = CAPABILITIES | frozenset({"friend.text.receive", "friend.tex
                                            "friend.request.receive", "friend.request.accept",
                                            "contact.read",
                                            "group.member.invite", "group.create", "group.members.read", "group.events",
-                                           "voice.receive", "voice.send", "friend.voice.send", "group.voice.send",
+                                           "voice.receive", "voice.xml.receive", "voice.send", "friend.voice.send", "group.voice.send",
                                            "emoticon.send", "emoticon.extract"})
 
 TEXT_42011_CAPABILITIES = CAPABILITIES | frozenset({
@@ -28,7 +28,7 @@ TEXT_42011_CAPABILITIES = CAPABILITIES | frozenset({
     "group.text.mention", "group.members.read", "group.events", "message.recall",
     "image.receive", "image.send", "file.receive", "file.send",
     "friend.file.receive", "friend.file.send", "group.file.receive", "group.file.send",
-    "voice.receive", "voice.send", "friend.voice.send", "group.voice.send"})
+    "voice.receive", "voice.xml.receive", "voice.send", "friend.voice.send", "group.voice.send"})
 
 
 # 新版只公布已验证的功能；其他能力必须单独适配并完成实测。
@@ -37,8 +37,9 @@ TEXT_42012_CAPABILITIES = CAPABILITIES | frozenset({
     "group.text.receive", "group.text.send",
     "group.text.mention", "message.recall", "group.members.read", "group.events", "image.receive", "image.send",
     "file.receive", "file.send", "friend.file.receive", "friend.file.send",
-    "group.file.receive", "group.file.send", "voice.receive", "voice.send",
-    "friend.voice.send", "group.voice.send",
+    "group.file.receive", "group.file.send", "voice.receive", "voice.xml.receive", "voice.send",
+    "friend.voice.send", "group.voice.send", "video.send", "group.video.send", "video.receive", "friend.video.receive", "group.video.receive", "friend.request.send",
+    "text.quote.send", "message.recall.local",
 })
 
 
@@ -102,6 +103,7 @@ class NativeTextBackend(NativeFileHelperBackend):
         self.raw = NativeTextService(pid=config.get("wechat_pid"), account=config.get("wechat_account"),
                                      media_directory=data_root / config.get("image_directory", ".runtime/images"),
                                      image_allowlist=config.get("chat_allowlist", []),
+                                     friend_add_rooms=config.get("groups", []),
                                      wechat_data_directory=(data_root / config["wechat_data_directory"]
                                                             if config.get("wechat_data_directory") else None),
                                      emoticon_directory=data_root / config.get("emoticon_directory", ".runtime/emoticons"),
@@ -124,6 +126,12 @@ class NativeTextBackend(NativeFileHelperBackend):
     def chats(self):
         return list(self.raw.chats.values())
 
+    def set_local_recall(self, enabled):
+        return self.raw.set_local_recall(enabled)
+
+    def send_quote_text(self, chat_id, original_id, content):
+        return self.raw.send_quote_text(chat_id, original_id, content)
+
     def send_at_text(self, room_wxid, content, at_list):
         return self.raw.send_at_text(room_wxid, content, at_list)
 
@@ -136,11 +144,17 @@ class NativeTextBackend(NativeFileHelperBackend):
     def send_file(self, chat_id, path):
         return self.raw.send_file(chat_id, path)
 
+    def send_video(self, chat_id, path):
+        return self.raw.send_video(chat_id, path)
+
     def friend_requests(self):
         return self.raw.friend_requests()
 
     def accept_friend(self, request_id):
         return self.raw.accept_friend(request_id)
+
+    def send_friend_request(self, wxid, room, message):
+        return self.raw.send_friend_request(wxid, room, message)
 
     def invite_group_members(self, room, members):
         return self.raw.invite_group_members(room, members)

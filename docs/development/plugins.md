@@ -99,23 +99,31 @@ def scheduled_greeting(self, params, ctx):
 | --- | --- |
 | `ctx.reply(message, text)` | 回复文本 |
 | `ctx.reply_at(message, text)` | 真正艾特群消息作者并回复 |
+| `ctx.reply_quote(message, text)` | [在原会话发送微信原生引用回复](../messages/text.md#原生引用回复)，需要 `text.quote.send` |
 | `ctx.send_text(chat_id, text)` | 向明确的会话发送文本 |
 | `ctx.send_at_text(room, text, members, expected_session=message.session_id, display_names=names)` | 向指定群发送真实艾特，支持 1–8 位成员 |
 | `ctx.reply_image(message, path)` | 回复本地图片 |
 | `ctx.send_image(chat_id, path)` | 发送本地图片 |
 | `ctx.reply_file(message, path)` | 回复本地文件附件 |
 | `ctx.send_file(chat_id, path)` | 发送本地文件附件 |
+| `ctx.reply_video(message, path)` | 以微信视频消息回复 MP4 |
+| `ctx.send_video(chat_id, path)` | 以微信视频消息发送 MP4 |
 | `ctx.reply_emoticon(message, path)` | 回复 GIF 表情 |
 | `ctx.send_emoticon(chat_id, path)` | 发送 GIF 表情 |
 | `ctx.reply_voice(message, path)` | 回复语音条 |
 | `ctx.send_voice(chat_id, path)` | 发送语音条 |
 | `ctx.export_emoticons(convert=True)` | 显式导出当前账号本地缓存表情 |
+| `ctx.send_friend_request(wxid, verification_text, room="", expected_session=incoming.session_id)` | 通过共同群主动发送好友申请（Windows 4.2.0.12） |
 | `ctx.group_members(room, expected_session=message.session_id)` | 读取完整群成员快照，缓存不可用时返回 `None` |
 | `ctx.contacts(expected_session=message.session_id)` | 扫描当前账号的好友及资料，需要 `contact.read` 能力 |
 | `ctx.group_member_name(room, wxid, expected_session=message.session_id)` | 查询群昵称，未设置时返回微信名 |
 | `ctx.group_member_role(room, wxid, expected_session=message.session_id)` | 查询群主、群管理员或普通群友身份，未确认时返回 `unknown` |
 
 每类文件有独立限制，见对应的消息章节。`ctx.send_voice` 发送已有音频；可选的 `voice_reply` 插件通过 Fish Audio 合成艾特对话的语音，见[语音回复](../messages/voice.md#fish-audio-文字转语音)。
+
+视频发送目前支持微信 4.2.0.12 的本地 MP4 文件。可在插件的 `requires` 中声明 `video.send`；框架会读取容器时长，并将副本放入微信暂存目录。文件传输助手和群聊已验证，好友私聊尚未单独实测。
+
+语音插件可订阅类型 `34` 并声明 `voice.receive` 和 `voice.xml.receive`，通过 `message.data["voice_xml"]` 读取完整语音 XML（含微信本次提供的 `aeskey`、`voiceurl` 等属性）。`raw_content` 保留相同内容，音频缓存失败时仍可读取有效 XML。见[语音 XML](../messages/voice.md#读取收到的语音-xml)。
 
 ## 处理图片
 
@@ -141,7 +149,7 @@ image.receive / image.send
 file.receive / file.send
 friend.file.receive / friend.file.send
 group.file.receive / group.file.send
-friend.request.receive / friend.request.accept
+friend.request.receive / friend.request.accept / friend.request.send
 group.member.invite / group.create
 group.members.read / group.events
 contact.read
@@ -157,6 +165,12 @@ voice.send / friend.voice.send / group.voice.send
 需要明确启用的插件可在 `plugin.json` 设置 `"default_enabled": false`。当旧配置尚无该插件条目时，框架也会保持关闭；控制台 `enable 插件名` 才会启用并保存设置。
 
 `message.recall` 表示后端可提供微信原始消息编号和撤回通知。框架把撤回事件及媒体监控元数据定向交给内置防撤回插件，不广播为普通文本；参考 `anti_recall` 的精确编号匹配、会话缓存和发送连接检查。它同时补发文字、内置表情和 emoji；后端提供 `emoticon.send` 时，还会异步缓存类型 47 的原件并用 `ctx.reply_emoticon` 补发。原始 XML、CDN 地址及凭据不应进入日志或大模型。补发插件默认开启，网页监控标记独立保留。
+
+## 本机保留撤回消息
+
+微信 4.2.0.12 的指定构建提供 `message.recall.local` 能力。内置 `anti_recall_local` 在 `on_load` 中调用 `owner = ctx.enable_local_recall()`，在 `on_unload` 中调用 `ctx.disable_local_recall(owner)`。凭证用于避免热重载时旧实例关闭新实例的开关；连接恢复后框架会重新应用启用状态。
+
+本机保留不发送新消息，作用于当前账号的全部会话；与会话白名单内的四类撤回补发独立。默认关闭，使用范围与限制见[防撤回](../messages/recall.md)。
 
 ## 联系人
 

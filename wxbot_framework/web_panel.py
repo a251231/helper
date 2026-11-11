@@ -364,6 +364,7 @@ class PanelController:
                 if name not in paths or not isinstance(data[name], dict):
                     raise PanelError('模型配置格式不正确')
                 value = read_json(paths[name])
+                previous_url = value.get('base_url')
                 fields = {'base_url', 'model', 'timeout_seconds'} | ({'max_tokens', 'json_mode', 'token_limit_parameter', 'extra_body'} if name == 'llm'
                             else {'default_voice', 'max_chars_per_clip'})
                 for key in fields:
@@ -379,8 +380,11 @@ class PanelController:
                 # 允许先保存未填密钥的模板，其余字段沿用真实客户端验证。
                 validation = dict(value, api_key=value.get('api_key') or 'validation-only')
                 if name == 'llm':
-                    from .llm import LLMClient
+                    from .llm import LLMClient, is_worldguide_url
                     LLMClient(validation)
+                    if (value.get('api_key') and not key.strip() and
+                            is_worldguide_url(previous_url) != is_worldguide_url(value.get('base_url'))):
+                        raise PanelError('切换 WorldGuide 接口时，请填写新接口的 API 密钥或清除已保存的密钥')
                 else:
                     from .tts import FishTTS
                     FishTTS.from_options(validation)
@@ -821,6 +825,56 @@ class PanelController:
                 with self.lock:
                     self.send_jobs[identifier].update(status='sent')
         threading.Thread(target=deliver, name='PanelTextSend', daemon=True).start()
+        return self.send_status(identifier)
+
+    def send_friend_request(self, data):
+        """Submit one account-bound request; duplicate request IDs never resend."""
+        from .friend_add import validate_friend_add
+        wxid, room, message = validate_friend_add(data.get('wxid'), data.get('room'), data.get('message'), allow_auto=True)
+        identifier, session = data.get('request_id'), data.get('session_id')
+        if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', identifier):
+            raise PanelError('发送请求编号无效')
+        if not isinstance(session, str) or not session or len(session) > 80:
+            raise PanelError('请先刷新微信连接', 409)
+        payload = ('friend_add', wxid, room, message, session)
+        with self.lock:
+            previous = self.send_jobs.get(identifier)
+            if previous is not None:
+                if previous['payload'] != payload:
+                    raise PanelError('发送编号已使用，请重新提交', 409)
+                return self.send_status(identifier)
+            if any(job['status'] == 'sending' for job in self.send_jobs.values()):
+                raise PanelError('上一条请求仍在发送，请等待结果', 409)
+            app = self.app
+            if app is None or not app._connection_ready or self.state == 'stopping':
+                raise PanelError('请先启动并连接机器人', 409)
+            if not app.service.session_is_current(session):
+                raise PanelError('微信连接已变化，请刷新连接', 409)
+            if 'friend.request.send' not in getattr(app.backend, 'capabilities', ()):
+                raise PanelError('当前微信版本尚未开放主动好友申请', 409)
+            allowed = app.config.get('chat_allowlist', [])
+            if allowed and room and room not in allowed:
+                raise PanelError('来源群不在收发白名单中')
+            self.send_jobs[identifier] = {'request_id': identifier, 'payload': payload,
+                                          'status': 'sending', 'error': ''}
+            while len(self.send_jobs) > 64:
+                del self.send_jobs[next(iter(self.send_jobs))]
+        def deliver():
+            try:
+                if app.service.send_friend_request(wxid, message, room=room, expected_session=session) is not True:
+                    raise RuntimeError('微信未确认申请发送')
+            except Exception as error:
+                safe_messages = {"未在已发现的群中找到该成员，请手动选择来源群",
+                                 "群成员缓存尚未就绪，请在微信打开群聊后重试",
+                                 "目标不在该群的已验证成员列表中", "来源群不在收发白名单中",
+                                 "主动好友申请仅适配微信 4.2.0.12"}
+                detail = str(error) if str(error) in safe_messages else '申请未确认，请先核对微信，勿重复发送'
+                with self.lock:
+                    self.send_jobs[identifier].update(status='failed', error=detail)
+            else:
+                with self.lock:
+                    self.send_jobs[identifier].update(status='sent')
+        threading.Thread(target=deliver, name='PanelFriendAdd', daemon=True).start()
         return self.send_status(identifier)
 
     def send_connection(self):

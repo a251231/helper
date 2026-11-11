@@ -153,6 +153,8 @@
 
 `gateway.example.com` 是占位地址，需要替换。`base_url` 保留服务商要求的路径前缀，例如 `/v1`；程序在后面追加 `/chat/completions`。也可以直接填写完整的 `/chat/completions` 地址，不会重复追加。仅提供 Responses 或其他原生协议的服务不能直接使用。
 
+在管理台的「模型与语音」中打开 **模型预设**，可选用 WorldGuide 的 GPT、Gemini 和 Grok 文本模型。选择后会填入 `https://api.worldguide.online/v1` 并开启 JSON 模式。GPT 和 Gemini 预设使用 2048 tokens、60 秒超时和空扩展参数。Grok 预设使用 1024 tokens、45 秒超时和 `{"reasoning_effort":"low"}`。填写 WorldGuide 密钥后保存。[WorldGuide 模型与价格](https://worldguide.online/pricing)
+
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `json_mode` | `true` | 发送 `response_format: {"type":"json_object"}`；接口不支持时改为 `false` |
@@ -176,7 +178,9 @@
 
 修改模型配置后重载对应插件或重启。聊天总结、艾特对话会将对应文本交给你配置的模型服务；记录范围见[群聊功能](./features.md)。
 
-## 防撤回补发
+## 防撤回
+
+`plugins.anti_recall_local.enabled` 默认是 `false`，旧配置缺少条目时保持关闭。微信 4.2.0.12 的指定构建可在网页启用“本机防撤回”，保留当前账号电脑微信里的原消息，独立于下方四类补发开关。
 
 `anti_recall`（文字、内置表情、emoji 和已缓存表情包）、`anti_recall_image`（图片）、`anti_recall_file`（文件）、`anti_recall_voice`（语音）默认开启，旧配置缺少条目时也会启用。可在网页插件管理分别关闭，或在对应 `plugins.<插件名>` 设置 `"enabled": false`。四个插件独立工作；会话白名单非空时只在其中的会话补发，不需要模型配置。表情包缓存不需要配置微信数据目录或导出收藏；附件必须已下载成功，详细限制和缓存边界见[防撤回与自动补发](../messages/recall.md)。
 
