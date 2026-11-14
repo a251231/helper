@@ -8,10 +8,12 @@
 | --- | --- |
 | `runtime.py` / `backend.py` | 微信连接、消息分发与后端能力 |
 | `plugins.py` / `sdk.py` | 插件加载、隔离与业务 API |
+| `miniprograms.py` | 账号隔离的小程序客户端、组件描述、引擎点击及输入 |
 | `members.py` / `message_monitor.py` | 群称呼、当天聊天缓存与管理台消息缓冲 |
 | `llm.py` / `personality.py` / `speech.py` | 模型调用、人格与语音回复 |
 | `plugin_business.py` / `plugin_sources.py` | 业务函数编辑、版本校验与默认恢复 |
 | `web_panel.py` | 管理台配置、插件事务和机器人控制 |
+| `contacts.py` / `directory_cache.py` | 只读联系人扫描，按账号保存联系人快照和已发现群 |
 | `panel_http.py` / `panel_common.py` | HTTP 路由、本机访问校验、共用错误与日志脱敏 |
 | `robot_hub.py` | 账号发现与工作进程管理 |
 | `articles.py` | 按账号保存公众号文章、转换只读 Markdown、缓存和校验图片 |
@@ -24,10 +26,13 @@
 
 原生层见 [原生适配说明](https://github.com/Prometheus-first/helper/blob/main/native/README.md)。`native/run_selftest.py` 名称虽然包含 selftest，但承担生产运行所需的进程、远程调用和桥接清理，不能按测试残留删除。消息桥接、公众号桥接及其对应源码、版本指纹和 MinHook 也需要保留。
 
+小程序使用独立的 `miniprogram_bridge.cpp`、`miniprogram_transport.py` 和 `build_miniprogram/miniprogram_bridge.dll`。调用结束后关闭观察 Hook 并卸载；停止与退出守护同时检查残留桥接。构建只需使用 `-Target miniprograms`，不需要替换消息桥接。
+
 ## 本地数据与开发资料
 
 - `*.example.json` 是可分发模板，根目录的实际配置为本地设置。
 - `.runtime/robots/` 保存账号工作区；各工作区的数据库、插件覆盖代码和媒体缓存需要保留。
+- 各工作区的 `.runtime/directory_cache/` 保存联系人、备注、标签和已发现群，属于本地资料；重新扫描时更新，重启时读取，不作为临时测试文件清理。
 - `.runtime/` 其余运行缓存和 `logs/` 不属于源码，也不应进入仓库。不要在运行中清空它们。
 - `.runtime/articles/` 包含已同步的公众号目录、正文和图片，属于账号的本地数据。关注列表和微信的原始分页游标仅保留在内存，接口只返回当前账号的公开公众号字段与本地续页标识。
 - 逆向工具、旧适配资料、历史快照和一次性探针不属于运行目录；需要留存时放到项目外。
@@ -52,7 +57,7 @@ python tools/run_tests.py --pattern test_web_panel.py --verbose
 node --check webui/app.js
 node --check webui/moments.js
 node --check webui/articles.js
-node --test tests/test_articles_ui.cjs tests/test_send_chat_ui.cjs tests/test_wechat_login_ui.cjs
+node --test tests/test_*_ui.cjs
 npm ci
 npm run docs:build
 ```
