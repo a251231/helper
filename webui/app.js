@@ -42,6 +42,7 @@ let sendChatsAttempted = false;
 let taskRows=[], taskActions=[], taskActionSignature='', taskGeneration=0, taskLoading=false, taskLastFetch=0, taskSignature='';
 let groupNameDraft = new Map(), discoveredGroups = [];
 let contactData=null, contactGeneration=0, contactLoading=false, contactError='', contactIdentity='', contactDetail='', contactPage=0, contactSignature='';
+let contactDeleteJob=null, contactDeleteStatus='';
 let directoryLoadedKey='', directoryPendingKey='', directoryGroupsKey='', directoryGeneration=0, directoryRetryAt=0;
 const contactPageSize=50;
 const accountKey = row => row.pid + ':' + row.wxid;
@@ -51,11 +52,13 @@ const pages = {overview:'运行概览', plugins:'插件管理', groups:'群聊�
 const pluginNames = {anti_recall_local:['本机防撤回'], anti_recall:['文字防撤回'], anti_recall_image:['图片防撤回'], anti_recall_file:['文件防撤回'], anti_recall_voice:['语音防撤回'], image_gallery:['图库图片'], image_generation:['AI 生图'], wechat_update_guard:['微信更新保护'], picture_idiom:['看图猜成语'], idiom_chain:['成语接龙'], chat_summary:['聊天总结'], mention_chat:['艾特对话'], voice_reply:['语音回复'], group_notice:['进退群提醒'], member_identity:['群内昵称绑定'], personality:['切换人格'], friend_auto_accept:['自动通过好友'], chat_records:['聊天记录管理'], id_responder:['会话 ID 查询'], echo:['文字回声']};
 const escape = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-async function api(path, body, identifier = robot) {
+async function api(path, body, identifier = robot, {download = false, timeoutMs} = {}) {
   const scope = (path === 'robots' || path === 'accounts' || path.startsWith('accounts/') || path.startsWith('wechat-login/')) ? '' : (path.includes('?') ? '&' : '?') + 'robot=' + encodeURIComponent(identifier);
   const response = await fetch('/api/' + path + scope, {method: body === undefined ? 'GET' : 'POST', cache:'no-store',
     headers:{'X-Helper-Token':token, ...(body === undefined ? {} : {'Content-Type':'application/json'})},
+    ...(timeoutMs === undefined ? {} : {signal:AbortSignal.timeout(timeoutMs)}),
     ...(body === undefined ? {} : {body:JSON.stringify(body)})});
+  if (response.ok && download) return response.blob();
   const data = await response.json();
   if (!response.ok) { const error=new Error(data.error||'操作失败');error.status=response.status;throw error; }
   return data;
@@ -120,6 +123,20 @@ function renderState() {
   renderRobotOptions();renderAccounts();renderMessages();
   const running=!!state&&activeStates.includes(state.state);
   document.querySelectorAll('form:not(#send-form):not(#friend-add-form):not(#plugin-form):not(#moments-form):not(#articles-form):not(#task-form) .primary').forEach(node=>node.disabled=unavailable||!state||running||busy);
+  const recoveryForm=$('#windows-recovery-form');
+  const canEditRecovery=!!config?.account&&config.account===state?.account&&!running&&!busy&&!unavailable;
+  recoveryForm.elements.windows_auto_recovery.disabled=!canEditRecovery;
+  $('.primary',recoveryForm).disabled=!canEditRecovery;
+  $('#windows-recovery-status').textContent=({
+    restarting:'正在重启当前账号的微信。',
+    waiting_login:'请在新微信窗口登录原账号。',
+    waiting_cleanup:'原账号已登录，正在等待旧机器人清理。',
+    restarted:'原账号已登录，正在恢复机器人连接。',
+    limited:'已达到自动重启限制，请检查当前微信。',
+    failed:'自动恢复未完成，请检查当前微信。',
+    manual_login:'未能确认新微信实例，请手动登录并启动机器人。',
+    wrong_account:'新实例登录了其他账号，请手动启动对应机器人。'
+  })[state?.recovery_status]||'';
   $('#task-save').disabled=unavailable||!state||busy;
   renderSendState();
   renderContacts();
@@ -298,6 +315,7 @@ async function loadConfig() {
     $('.key-state',form).textContent = config[name]?.api_key_configured ? '已配置' : '尚未配置';
   }
   fill($('#delay-form'), config.text_send_delay);
+  fill($('#windows-recovery-form'), {windows_auto_recovery:config.windows_auto_recovery!==false});
 }
 const lines = value => [...new Set(value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean))];
 function renderGroupNames() {
@@ -321,6 +339,13 @@ $('#group-name-list').addEventListener('input', event => {
   if (input) groupNameDraft.set(input.dataset.groupName, input.value);
 });
 async function save(data, message) { await api('config',data); await loadConfig(); toast(message||'配置已保存，下次启动生效'); }
+$('#windows-recovery-form').onsubmit=event=>{
+  event.preventDefault();
+  const form=event.currentTarget;
+  if(!$('.primary',form).disabled)
+    action(()=>save({windows_auto_recovery:form.elements.windows_auto_recovery.checked,
+      expected_account:config.account},'自动恢复设置已保存'));
+};
 $('#start-selected').onclick = () => action(()=>launchAccounts(loggedAccounts.filter(row=>selectedAccounts.has(accountKey(row))&&row.selectable&&!activeStates.includes(row.state))));
 $('#refresh-accounts').onclick=()=>loadAccounts();
 $('#account-list').onchange=event=>{
@@ -574,28 +599,35 @@ async function pollSendStatus() {
   const job=pendingSend;if(!job||sendPolling)return;
   sendPolling=true;
   try {
-    const result=await api('send-status?id='+encodeURIComponent(job.id),undefined,job.robot);
+    const result=await api('send-status?id='+encodeURIComponent(job.id),undefined,job.robot,{timeoutMs:8000});
     if(pendingSend!==job||job.robot!==robot)return;
-    if(result.status==='sending')return;
+    if(result.status==='sending'){job.accepted=true;job.lastConfirmed=Date.now();return;}
     pendingSend=null;
     if(job.kind==='friend'){if(result.status==='sent'){$('#friend-add-wxid').value='';$('#friend-add-status').textContent='申请已发送，等待对方处理。';}else $('#friend-add-status').textContent=result.error||'申请未确认，请先核对微信。';}
     else if(result.status==='sent'){$('#send-content').value='';sendFeedback('已发送');}
     else sendFeedback(result.error||'发送未完成，请核对微信后再重发',true);
     renderSendState();
-  } catch(error) {if(pendingSend===job){if(job.kind==='friend')$('#friend-add-status').textContent='结果暂不确定，请先核对微信；不会自动重发。';else sendFeedback('暂时无法查询发送结果，请先核对微信。不会自动重发。',true);}}
+  } catch(error) {
+    if(pendingSend!==job||job.robot!==robot)return;
+    if(error.status===403||(error.status===404&&job.accepted)||Date.now()-job.lastConfirmed>=30000)pendingSend=null;
+    if(job.kind==='friend')$('#friend-add-status').textContent='结果暂不确定，请先核对微信；不会自动重发。';
+    else sendFeedback('暂时无法查询发送结果，请先核对微信。不会自动重发。',true);
+    renderSendState();
+  }
   finally {sendPolling=false;}
 }
 $('#send-form').onsubmit=async event=>{
   event.preventDefault();if($('#send-text').disabled||pendingSend)return;
-  const requested=robot,job={id:crypto.randomUUID(),robot:requested};pendingSend=job;
+  const requested=robot,job={id:crypto.randomUUID(),robot:requested,lastConfirmed:Date.now()};pendingSend=job;
   const body={request_id:job.id,session_id:sendSession,chat_id:$('#send-chat').value,content:$('#send-content').value,at_list:[...mentionSelection]};
   sendFeedback('正在发送…');renderSendState();
   try {
-    await api('send-text',body,requested);
+    await api('send-text',body,requested,{timeoutMs:8000});
+    job.accepted=true;
     if(pendingSend===job)await pollSendStatus();
   } catch(error) {
     if(pendingSend!==job)return;
-    if(error.status){pendingSend=null;sendFeedback(error.message,true);}
+    if(error.status&&error.status<500){pendingSend=null;sendFeedback(error.message,true);}
     else sendFeedback('发送结果暂不确定，请先核对微信。不会自动重发。',true);
     renderSendState();
   }
@@ -603,11 +635,11 @@ $('#send-form').onsubmit=async event=>{
 for(const id of ['friend-add-room','friend-add-wxid','friend-add-message'])$('#'+id).addEventListener('input',renderSendState);
 $('#friend-add-form').onsubmit=async event=>{
   event.preventDefault();if($('#friend-add-submit').disabled||pendingSend)return;
-  const requested=robot,job={id:crypto.randomUUID(),robot:requested,kind:'friend'};pendingSend=job;
+  const requested=robot,job={id:crypto.randomUUID(),robot:requested,kind:'friend',lastConfirmed:Date.now()};pendingSend=job;
   const body={request_id:job.id,session_id:sendSession,room:$('#friend-add-room').value,wxid:$('#friend-add-wxid').value.trim(),message:$('#friend-add-message').value};
   $('#friend-add-status').textContent='正在发送申请…';renderSendState();
-  try {await api('friend-request-send',body,requested);if(pendingSend===job)await pollSendStatus();}
-  catch(error){if(pendingSend!==job)return;if(error.status){pendingSend=null;$('#friend-add-status').textContent=error.message;}else $('#friend-add-status').textContent='结果暂不确定，请先核对微信；不会自动重发。';renderSendState();}
+  try {await api('friend-request-send',body,requested,{timeoutMs:8000});job.accepted=true;if(pendingSend===job)await pollSendStatus();}
+  catch(error){if(pendingSend!==job)return;if(error.status&&error.status<500){pendingSend=null;$('#friend-add-status').textContent=error.message;}else $('#friend-add-status').textContent='结果暂不确定，请先核对微信；不会自动重发。';renderSendState();}
 };
 setInterval(pollSendStatus,1500);
 function renderMessages() {
@@ -625,6 +657,121 @@ function renderMessages() {
 $('#message-search').oninput=renderMessages;
 $('#pause-messages').onclick=()=>{messagePaused=!messagePaused;$('#pause-messages').textContent=messagePaused?'继续滚动':'暂停滚动';if(!messagePaused)$('#message-scroll').scrollTop=$('#message-scroll').scrollHeight;};
 $('#clear-messages').onclick=()=>{messages=[];renderMessages();};
+const exportDialog = $('#message-export-dialog');
+const exportForm = $('#message-export-form');
+const exportChat = $('#export-chat');
+const exportKind = $('#export-chat-kind');
+const exportButton = $('#download-message-export');
+const exportStatus = $('#message-export-status');
+const exportError = $('.dialog-error', exportDialog);
+const archiveEnabled = $('#message-archive-enabled');
+const archiveError = $('#message-archive-error');
+let exportSelection = null;
+
+function renderArchive(selection) {
+  archiveEnabled.checked = selection.archive?.enabled === true;
+  archiveEnabled.disabled = !selection.account || selection.savingArchive;
+  archiveError.textContent = selection.archive?.write_failed ? '归档写入失败，请检查磁盘空间和权限。' : '';
+  archiveError.classList.toggle('hidden', !archiveError.textContent);
+}
+
+function renderExportChats() {
+  const previous = exportChat.value;
+  const rows = exportSelection?.chats.filter(row => !exportKind.value ||
+    (row.is_group ? 'group' : 'private') === exportKind.value) || [];
+  exportChat.replaceChildren(new Option('选择会话', ''));
+  for (const row of rows) {
+    const id = row.chat_id, label = row.name && row.name !== id ? row.name + ' · ' + id : id;
+    exportChat.add(new Option(label, id));
+  }
+  if (rows.some(row => row.chat_id === previous)) exportChat.value = previous;
+  exportChat.disabled = !rows.length;
+  exportButton.disabled = !exportChat.value || exportSelection?.downloading;
+  exportStatus.textContent = rows.length ? '' : '目前没有此类型的已记录会话。';
+}
+
+$('#open-message-export').onclick = async () => {
+  const selection = {robot, chats: [], account: '', downloading: false};
+  exportSelection = selection;
+  exportForm.reset();
+  renderArchive(selection);
+  renderExportChats();
+  exportStatus.textContent = '正在读取已记录的会话…';
+  openDialog('#message-export-dialog');
+  try {
+    const data = await api('recorded-chats', undefined, selection.robot);
+    if (exportSelection !== selection || robot !== selection.robot) return;
+    selection.chats = data.chats;
+    selection.account = data.account;
+    selection.archive = data.archive;
+    renderExportChats();
+    renderArchive(selection);
+  } catch (error) {
+    if (exportSelection !== selection || robot !== selection.robot) return;
+    exportStatus.textContent = '';
+    exportError.textContent = error.message;
+    exportError.classList.remove('hidden');
+  }
+};
+$('#close-message-export').onclick = () => exportDialog.close();
+exportDialog.onclose = () => { if (!exportDialog.open) exportSelection = null; };
+archiveEnabled.onchange = async () => {
+  const selection = exportSelection;
+  if (!selection?.account || selection.savingArchive || selection.robot !== robot) return;
+  selection.savingArchive = true;
+  archiveEnabled.disabled = true;
+  exportError.classList.add('hidden');
+  try {
+    selection.archive = await api('message-archive',
+      {account: selection.account, enabled: archiveEnabled.checked}, selection.robot);
+  } catch (error) {
+    if (exportDialog.open && exportSelection === selection && robot === selection.robot) {
+      exportError.textContent = error.message;
+      exportError.classList.remove('hidden');
+    }
+  } finally {
+    selection.savingArchive = false;
+    if (exportDialog.open && exportSelection === selection && robot === selection.robot) renderArchive(selection);
+  }
+};
+exportKind.onchange = () => {
+  if (exportSelection) renderExportChats();
+};
+exportChat.onchange = () => { exportButton.disabled = !exportChat.value || exportSelection?.downloading; };
+exportForm.onsubmit = async event => {
+  event.preventDefault();
+  const selection = exportSelection;
+  if (!selection?.account || selection.downloading || selection.robot !== robot) return;
+  const query = new URLSearchParams(new FormData(exportForm));
+  query.set('account', selection.account);
+  selection.downloading = true;
+  exportButton.disabled = true;
+  exportError.classList.add('hidden');
+  exportStatus.textContent = '正在生成 CSV…';
+  try {
+    const blob = await api('message-export?' + query, undefined, selection.robot, {download: true});
+    if (!exportDialog.open || exportSelection !== selection || robot !== selection.robot) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'helper-chat.csv';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    exportDialog.close();
+  } catch (error) {
+    if (exportDialog.open && exportSelection === selection && robot === selection.robot) {
+      exportError.textContent = error.message;
+      exportError.classList.remove('hidden');
+    }
+  } finally {
+    selection.downloading = false;
+    if (exportSelection === selection && robot === selection.robot) {
+      exportButton.disabled = !exportChat.value;
+      exportStatus.textContent = '';
+    }
+  }
+};
+
 async function pollMessages(requested,generation) {
   try {
     let tail=await api('messages?after='+messageCursor,undefined,requested);
@@ -702,16 +849,75 @@ function retainContacts() {
 }
 function resetContacts(message='') {
   contactGeneration++;contactData=null;contactLoading=false;contactError=message;contactIdentity='';contactDetail='';contactPage=0;contactSignature='';
+  contactDeleteStatus='';
   $('#contact-search').value='';$('#contact-tag').innerHTML='<option value="">全部标签</option>';
   renderContacts();
 }
 function contactTagText(row) {
   return row.tags_status==='ready'?(row.tags?.length?row.tags.join('、'):'无标签'):'暂不可读取';
 }
-function renderContactDetails(row,index) {
+function renderContactDetails(row,index,canDelete) {
   const fields=[['微信 ID',row.wxid,true],['微信号',row.alias,true],['昵称',row.nickname],['备注',row.remark],['描述',row.description],['性别',{male:'男',female:'女'}[row.sex]],['国家或地区',row.country],['省份',row.province],['城市',row.city],['个性签名',row.signature],['好友标签',contactTagText(row)]];
-  return `<tr class="contact-detail"><td colspan="4"><dl id="contact-detail-${index}" class="contact-details" aria-label="${escape(row.remark||row.nickname||row.wxid)} 的资料">${fields.filter(([,value])=>value).map(([label,value,mono])=>`<div><dt>${label}</dt><dd${mono?' class="contact-id"':''}>${escape(value)}</dd></div>`).join('')}</dl></td></tr>`;
+  const button=canDelete?`<button type="button" class="secondary small" data-friend-delete="${escape(row.wxid)}"${contactDeleteJob?' disabled':''}>删除好友</button>`:'';
+  return `<tr class="contact-detail"><td colspan="4"><dl id="contact-detail-${index}" class="contact-details" aria-label="${escape(row.remark||row.nickname||row.wxid)} 的资料">${fields.filter(([,value])=>value).map(([label,value,mono])=>`<div><dt>${label}</dt><dd${mono?' class="contact-id"':''}>${escape(value)}</dd></div>`).join('')}</dl>${button}</td></tr>`;
 }
+const contactRelationJobs=new Map();
+let displayedRelationRows=null;
+function renderFriendRelations(ready) {
+  const saved=contactRelationJobs.get(robot);
+  const job=saved?.account===directoryAccount()?saved:null;
+  const running=job?.status==='sending';
+  const button=$('#scan-friend-relations');
+  button.disabled=!ready||busy||contactLoading||!!contactDeleteJob||running||
+    contactData?.can_scan_relations!==true||contactData.cached||!contactData.session_id;
+  button.textContent=running?'正在检测…':'检测单向删除';
+  $('#friend-relations-results').classList.toggle('hidden',!job);
+  if(!job)return;
+  const {total,checked,unknown,rows}=job.scan;
+  const progress=total===null?'正在读取当前账号的好友…':`已检测 ${checked} / ${total} 位 · 疑似 ${rows.length} 位 · 待核对 ${unknown} 位`;
+  const feedback=job.error?`${job.error} ${progress}`:progress;
+  if($('#friend-relations-status').textContent!==feedback)$('#friend-relations-status').textContent=feedback;
+  $('#friend-relations-status').classList.toggle('error',!!job.error);
+  $('#friend-relations-table').classList.toggle('hidden',!rows.length);
+  if(displayedRelationRows!==rows){
+    $('#friend-relations-list').innerHTML=rows.map(row=>`<tr><td><span class="contact-name">${escape(row.remark||row.nickname||row.wxid)}</span></td><td><span class="contact-id">${escape(row.wxid)}</span></td></tr>`).join('');
+    displayedRelationRows=rows;
+  }
+}
+
+async function scanFriendRelations() {
+  if($('#scan-friend-relations').disabled)return;
+  const requested=robot,{account,session_id}=contactData;
+  if(!confirm(`检测账号 ${account} 的好友关系？微信可能生成“你已添加了对方”提示，部分好友关系也可能更新。`))return;
+  const job={id:crypto.randomUUID(),account,status:'sending',error:'',
+    scan:{total:null,checked:0,unknown:0,rows:[]}};
+  contactRelationJobs.set(requested,job);renderContacts();
+  const readStatus=()=>api('send-status?id='+encodeURIComponent(job.id),undefined,requested,{timeoutMs:8000});
+  try {
+    let result;
+    try{
+      result=await api('friend-relations',{request_id:job.id,account,session_id,confirm_wechat_effects:true},
+        requested,{timeoutMs:8000});
+    }catch(error){
+      if(error.status)throw error;
+      // Recover the original job ID after a lost HTTP reply without submitting again.
+      result=await readStatus();
+    }
+    for(;;){
+      job.status=result.status;job.error=result.error||'';job.scan=result.scan||job.scan;
+      if(robot===requested)renderContacts();
+      if(job.status!=='sending')break;
+      await new Promise(resolve=>setTimeout(resolve,1500));
+      result=await readStatus();
+    }
+  }catch(error){
+    job.status='unknown';
+    job.error=error.status&&error.status!==404?error.message:'暂时无法读取检测状态，请在微信核对。';
+  }finally{
+    if(robot===requested)renderContacts();
+  }
+}
+
 function renderContacts() {
   if(contactData&&contactData.account!==directoryAccount()) {
     resetContacts();return;
@@ -720,8 +926,9 @@ function renderContacts() {
     retainContacts();
   }
   const ready=serviceAvailable&&!!state?.connected;
-  $('#scan-contacts').disabled=!ready||busy||contactLoading;
+  $('#scan-contacts').disabled=!ready||busy||contactLoading||!!contactDeleteJob;
   $('#scan-contacts').textContent=contactLoading?'正在扫描…':'扫描联系人';
+  renderFriendRelations(ready);
   $('#contact-search').disabled=!contactData;
   $('#contact-tag').disabled=!contactData;
   const query=$('#contact-search').value.trim().toLowerCase(),tag=$('#contact-tag').value;
@@ -729,7 +936,7 @@ function renderContacts() {
   const rows=all.filter(row=>(!query||[row.wxid,row.alias,row.nickname,row.remark,...(row.tags||[])].some(value=>String(value||'').toLowerCase().includes(query)))&&(!tag||(tag==='__untagged'?row.tags_status==='ready'&&!row.tag_ids?.length&&!row.tags?.length:tag==='__unavailable'?row.tags_status!=='ready':row.tag_ids?.includes(tag))));
   const pageCount=Math.max(1,Math.ceil(rows.length/contactPageSize));contactPage=Math.min(contactPage,pageCount-1);
   $('#contact-count').textContent=contactData?((query||tag?rows.length+' / ':'')+all.length+' 位'):'';
-  let status=contactLoading?'正在扫描当前账号的联系人…':contactError;
+  let status=contactLoading?'正在扫描当前账号的联系人…':contactError||contactDeleteStatus;
   if(!status&&contactData) {
     const date=new Date(contactData.scanned_at),time=Number.isNaN(date.getTime())?'':date.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
     status=(contactData.cached?'本地缓存':'已保存')+(time?' · '+time:'')+(contactData.complete?'':' · 名单可能尚未同步完整');
@@ -742,14 +949,15 @@ function renderContacts() {
   $('#contact-page').textContent=`第 ${contactPage+1} / ${pageCount} 页`;
   $('#contact-previous').disabled=contactPage===0||contactLoading;
   $('#contact-next').disabled=contactPage>=pageCount-1||contactLoading;
-  const signature=JSON.stringify([contactGeneration,contactLoading,ready,query,tag,contactPage,contactDetail,contactError]);
+  const canDelete=ready&&!busy&&!contactLoading&&contactData?.can_delete===true&&!contactData.cached;
+  const signature=JSON.stringify([contactGeneration,contactLoading,ready,query,tag,contactPage,contactDetail,contactError,canDelete,!!contactDeleteJob]);
   if(signature===contactSignature)return;
   contactSignature=signature;
   const focusId=document.activeElement?.dataset.contact;
   const empty=contactLoading&&!contactData?'正在读取联系人…':!contactData?(!ready?'暂无本地联系人，连接后可扫描。':'尚未扫描联系人。'):query||tag?'没有匹配的联系人。':'本地缓存中暂无好友，请在微信打开通讯录后重新扫描。';
   $('#contact-list').innerHTML=rows.slice(contactPage*contactPageSize,(contactPage+1)*contactPageSize).map(row=>{
     const index=all.indexOf(row),expanded=contactDetail===row.wxid;
-    return `<tr class="contact-row${expanded?' selected':''}"><td><span class="contact-name">${escape(row.remark||row.nickname||row.wxid)}</span>${row.remark&&row.nickname&&row.remark!==row.nickname?`<span class="contact-nickname">${escape(row.nickname)}</span>`:''}<span class="contact-id">${escape(row.wxid)}</span></td><td class="contact-alias"><span class="sr-only">微信号：</span>${escape(row.alias||'未提供')}</td><td class="contact-tags"><span class="sr-only">好友标签：</span>${escape(contactTagText(row))}</td><td class="contact-action"><button type="button" class="text-button small" data-contact="${escape(row.wxid)}" aria-expanded="${expanded}"${expanded?` aria-controls="contact-detail-${index}"`:''} aria-label="${expanded?'收起':'查看'} ${escape(row.remark||row.nickname||row.wxid)} 的资料">${expanded?'收起':'详情'}</button></td></tr>`+(expanded?renderContactDetails(row,index):'');
+    return `<tr class="contact-row${expanded?' selected':''}"><td><span class="contact-name">${escape(row.remark||row.nickname||row.wxid)}</span>${row.remark&&row.nickname&&row.remark!==row.nickname?`<span class="contact-nickname">${escape(row.nickname)}</span>`:''}<span class="contact-id">${escape(row.wxid)}</span></td><td class="contact-alias"><span class="sr-only">微信号：</span>${escape(row.alias||'未提供')}</td><td class="contact-tags"><span class="sr-only">好友标签：</span>${escape(contactTagText(row))}</td><td class="contact-action"><button type="button" class="text-button small" data-contact="${escape(row.wxid)}" aria-expanded="${expanded}"${expanded?` aria-controls="contact-detail-${index}"`:''} aria-label="${expanded?'收起':'查看'} ${escape(row.remark||row.nickname||row.wxid)} 的资料">${expanded?'收起':'详情'}</button></td></tr>`+(expanded?renderContactDetails(row,index,canDelete):'');
   }).join('')||`<tr><td colspan="4" class="table-empty">${empty}</td></tr>`;
   if(focusId)[...$('#contact-list').querySelectorAll('[data-contact]')].find(node=>node.dataset.contact===focusId)?.focus({preventScroll:true});
 }
@@ -771,6 +979,39 @@ async function scanContacts() {
     if(requested===robot&&generation===contactGeneration){contactLoading=false;renderContacts();}
   }
 }
+async function deleteContact(wxid) {
+  const snapshot=contactData,requested=robot;
+  if(contactDeleteJob||contactLoading||busy||!state?.connected||!serviceAvailable||
+    !snapshot?.can_delete||snapshot.cached||!snapshot.session_id||snapshot.account!==directoryAccount())return;
+  const row=snapshot.contacts.find(contact=>contact.wxid===wxid);
+  if(!row||!confirm(`从账号 ${snapshot.account} 删除好友 ${row.remark||row.nickname||wxid}（${wxid}）？聊天记录会保留。`))return;
+  const job={id:crypto.randomUUID(),robot:requested};
+  contactDeleteJob=job;contactDeleteStatus='等待微信确认删除…';contactError='';renderContacts();
+  const current=()=>robot===requested&&contactData===snapshot&&directoryAccount()===snapshot.account;
+  try {
+    let result=await api('friend-delete',{request_id:job.id,wxid,account:snapshot.account,session_id:snapshot.session_id,keep_history:true},requested,{timeoutMs:8000});
+    for(let attempt=0;current()&&result.status==='sending'&&attempt<45;attempt++){
+      await new Promise(resolve=>setTimeout(resolve,1000));
+      if(!current())return;
+      result=await api('send-status?id='+encodeURIComponent(job.id),undefined,requested,{timeoutMs:8000});
+    }
+    if(!current())return;
+    if(result.status==='deleted'){
+      contactGeneration++;
+      setContactData({...snapshot,contacts:snapshot.contacts.filter(contact=>contact.wxid!==wxid)});
+      contactDetail='';contactDeleteStatus='微信已确认删除好友';
+      contactDeleteJob=null;renderContacts();
+      await scanContacts();
+    }else{
+      contactDeleteStatus='';contactError=result.error||'微信未返回可确认的删除结果，请在微信核对';
+    }
+  }catch(error){
+    if(current()){contactDeleteStatus='';contactError=error.status?error.message:'暂时无法确认删除结果，请在微信核对';}
+  }finally{
+    if(contactDeleteJob===job)contactDeleteJob=null;
+    renderContacts();
+  }
+}
 async function validateContactSession(requested,generation) {
   if(!contactData||contactData.cached||contactLoading||!state?.connected)return;
   const session=contactData.session_id,scannedGeneration=contactGeneration;
@@ -783,9 +1024,16 @@ async function validateContactSession(requested,generation) {
   }
 }
 $('#scan-contacts').onclick=scanContacts;
+$('#scan-friend-relations').onclick=scanFriendRelations;
 $('#contact-search').oninput=()=>{contactPage=0;contactDetail='';renderContacts();};
 $('#contact-tag').onchange=()=>{contactPage=0;contactDetail='';renderContacts();};
-$('#contact-list').onclick=event=>{const button=event.target.closest('[data-contact]');if(!button)return;contactDetail=contactDetail===button.dataset.contact?'':button.dataset.contact;renderContacts();};
+$('#contact-list').onclick=event=>{
+  const remove=event.target.closest('[data-friend-delete]');
+  if(remove){deleteContact(remove.dataset.friendDelete);return;}
+  const button=event.target.closest('[data-contact]');
+  if(!button)return;
+  contactDetail=contactDetail===button.dataset.contact?'':button.dataset.contact;renderContacts();
+};
 for(const [id,direction] of [['previous',-1],['next',1]])$('#contact-'+id).onclick=()=>{contactPage+=direction;contactDetail='';renderContacts();$('#contact-list').closest('table').scrollIntoView({block:'start'});};
 function serviceDisconnected() {
   serviceAvailable=false;
@@ -905,6 +1153,7 @@ async function loadRobots(){
 }
 async function switchRobot(identifier){
   if($('#plugin-dialog').open)$('#plugin-dialog').close();
+  if(exportDialog.open)exportDialog.close();
   articles.reset();
   resetContacts();
   resetDirectoryCache();

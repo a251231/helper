@@ -15,7 +15,7 @@
 <body>
 <a class="skip-link" href="#workspace">跳转到主要内容</a>
 <aside class="sidebar" id="primary-sidebar" aria-label="工作空间导航">
-  <a class="brand" href="#overview" aria-label="helper v1.1 管理台首页">helper<span class="brand-version">v1.1</span></a>
+  <a class="brand" href="#overview" aria-label="helper v1.2 管理台首页">helper<span class="brand-version">v1.2</span></a>
   <nav aria-label="主导航">
     <a href="#overview" data-page="overview"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="2"/><path d="M3.5 9h17M9 9v11.5"/></svg>运行概览</a>
     <a href="#plugins" data-page="plugins"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="6.5" height="6.5" rx="1"/><rect x="14" y="3.5" width="6.5" height="6.5" rx="1"/><rect x="3.5" y="14" width="6.5" height="6.5" rx="1"/><rect x="14" y="14" width="6.5" height="6.5" rx="1"/></svg>插件管理<span id="nav-plugin-count" class="nav-count">—</span></a>
@@ -49,8 +49,14 @@
       <p id="account-error" class="account-error hidden" role="status"></p>
       <div id="batch-result" class="batch-result hidden" role="status" aria-live="polite"></div>
     </section>
+    <form id="windows-recovery-form" class="settings-section">
+      <h2>微信自动恢复</h2>
+      <label class="inline"><input name="windows_auto_recovery" type="checkbox" checked>原生操作卡死时重启当前账号的微信</label>
+      <p id="windows-recovery-status" class="count" role="status"></p>
+      <div class="form-footer"><span class="save-hint">停止后保存</span><button class="primary" type="submit">保存自动恢复设置</button></div>
+    </form>
     <section class="section message-monitor" aria-labelledby="messages-heading">
-      <div class="section-heading"><h2 id="messages-heading">消息监控 <span id="message-count" class="count">0 条</span></h2><div class="message-actions"><button id="pause-messages" class="secondary small">暂停滚动</button><button id="clear-messages" class="text-button small">清空视图</button></div></div>
+      <div class="section-heading"><h2 id="messages-heading">消息监控 <span id="message-count" class="count">0 条</span></h2><div class="message-actions"><button id="open-message-export" class="secondary small" type="button">归档与导出</button><button id="pause-messages" class="secondary small">暂停滚动</button><button id="clear-messages" class="text-button small">清空视图</button></div></div>
       <label class="sr-only" for="message-search">搜索消息</label><input id="message-search" class="message-search" type="search" placeholder="搜索 ID、昵称或内容" autocomplete="off">
       <p id="message-error" class="account-error hidden" role="status"></p>
       <div id="message-scroll" class="table-container message-scroll" tabindex="0" aria-label="实时消息列表"><table class="message-table"><thead><tr><th scope="col">时间</th><th scope="col">会话 ID</th><th scope="col">发送者</th><th scope="col">消息内容</th></tr></thead><tbody id="message-list"><tr><td colspan="4" class="table-empty">正在读取消息…</td></tr></tbody></table></div>
@@ -101,12 +107,17 @@
     <section class="section" aria-labelledby="task-list-heading"><div class="section-heading"><h2 id="task-list-heading">任务列表</h2><button id="task-refresh" class="secondary small" type="button">刷新</button></div><p id="task-status" class="account-error" role="status" aria-live="polite"></p><div class="table-container"><table class="task-table"><thead><tr><th>任务与会话</th><th>执行时间</th><th>状态</th><th>操作</th></tr></thead><tbody id="task-list"><tr><td colspan="4" class="table-empty">暂无任务。</td></tr></tbody></table></div></section>
   </section>
   <section class="page hidden" id="page-contacts" aria-labelledby="contacts-heading">
-    <div class="page-heading"><h1 id="contacts-heading">联系人 <span id="contact-count" class="count"></span></h1><button id="scan-contacts" class="primary" type="button" disabled>扫描联系人</button></div>
+    <div class="page-heading"><h1 id="contacts-heading">联系人 <span id="contact-count" class="count"></span></h1><div class="contact-heading-actions"><button id="scan-friend-relations" class="secondary" type="button" disabled>检测单向删除</button><button id="scan-contacts" class="primary" type="button" disabled>扫描联系人</button></div></div>
     <div class="contact-filters">
       <label class="search"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5"/><path d="m12 12 4.5 4.5"/></svg><input id="contact-search" type="search" placeholder="搜索昵称、备注、微信号、wxid 或标签" aria-label="搜索联系人" autocomplete="off" disabled></label>
       <label class="contact-filter"><span class="sr-only">筛选好友标签</span><select id="contact-tag" aria-label="筛选好友标签" disabled><option value="">全部标签</option></select></label>
     </div>
     <p id="contact-status" class="contact-status" role="status" aria-live="polite">请先启动并连接当前账号。</p>
+    <section id="friend-relations-results" class="section hidden" aria-labelledby="friend-relations-heading">
+      <div class="section-heading"><h2 id="friend-relations-heading">疑似被单向删除</h2></div>
+      <p id="friend-relations-status" class="contact-status" role="status" aria-live="polite"></p>
+      <div id="friend-relations-table" class="table-container hidden"><table><thead><tr><th scope="col">联系人</th><th scope="col">微信 ID</th></tr></thead><tbody id="friend-relations-list"></tbody></table></div>
+    </section>
     <div class="table-container"><table class="contact-table"><thead><tr><th scope="col">联系人</th><th scope="col">微信号</th><th scope="col">好友标签</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead><tbody id="contact-list"><tr><td colspan="4" class="table-empty">连接后点击“扫描联系人”。</td></tr></tbody></table></div>
     <div id="contact-pagination" class="contact-pagination hidden"><span id="contact-page" class="count"></span><div><button id="contact-previous" class="secondary small" type="button">上一页</button><button id="contact-next" class="secondary small" type="button">下一页</button></div></div>
   </section>
@@ -200,6 +211,21 @@
 
 </main>
 <div id="toast" class="toast hidden" role="status"></div>
+<dialog id="message-export-dialog" aria-labelledby="message-export-title">
+  <form id="message-export-form">
+    <div class="dialog-heading"><h2 id="message-export-title">归档与导出</h2><button id="close-message-export" type="button" class="text-button">关闭</button></div>
+    <label class="inline"><input id="message-archive-enabled" type="checkbox" disabled aria-describedby="message-archive-hint">保留旧消息到本机</label>
+    <p id="message-archive-hint" class="note">每 15 秒或累计 200 条待写记录批量保存。</p>
+    <p id="message-archive-error" class="account-error hidden" role="status" aria-live="polite"></p>
+    <label for="export-chat-kind">会话类型</label><select id="export-chat-kind"><option value="">全部</option><option value="private">私聊</option><option value="group">群聊</option></select>
+    <label for="export-chat">会话</label><select id="export-chat" name="chat_id" required disabled><option value="">选择会话</option></select>
+    <div class="field-pair"><label>开始日期<input type="date" name="start"></label><label>结束日期<input type="date" name="end"></label></div>
+    <p class="note">日期按电脑本地时间筛选，留空表示不限。</p>
+    <p id="message-export-status" class="note" role="status" aria-live="polite"></p>
+    <p class="dialog-error hidden" role="alert"></p>
+    <div class="form-footer"><button type="submit" class="primary" id="download-message-export" disabled>下载 CSV</button></div>
+  </form>
+</dialog>
 <dialog id="moments-confirm" class="moments-confirm" aria-labelledby="moments-confirm-title">
   <div class="dialog-heading"><h2 id="moments-confirm-title">发布朋友圈</h2><button type="button" id="moments-cancel" class="text-button" aria-label="关闭预览">取消</button></div>
   <p id="moments-preview-account" class="moments-identity"></p>

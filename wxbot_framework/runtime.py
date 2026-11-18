@@ -43,6 +43,7 @@ class BotApplication:
         self.controls = queue.Queue(maxsize=64)
         self.last_cleanup = None
         self._connection_ready = False
+        self._replacement_guard = None
         self._last_connection_log = 0
         self._last_connection_error = ""
         self._group_tracker = None
@@ -58,6 +59,9 @@ class BotApplication:
             self._last_connection_error, self._last_connection_log = text, now
 
     def _connect(self):
+        if self._replacement_guard is not None and not self._replacement_guard():
+            self._log_connection_error(RuntimeError("等待重启后的微信实例登录原账号"))
+            return
         # 收信线程可能在 start() 返回前收到消息。先暂存，直到按实际微信版本
         # 更新插件能力；不能让旧版本的插件在新版本能力收缩期间处理消息。
         gate_lock, pending = threading.Lock(), []
@@ -244,7 +248,11 @@ class BotApplication:
             if message.data.get("dispatch_to_plugins", True):
                 if self.plugins.is_active("personality"):
                     message = prepare_switch(message, self.members)
-                self.plugins.dispatch(message)
+                if "personality_switch" in message.data or "personality_error" in message.data:
+                    # The switch was already handled before dispatch to protect the next message.
+                    self.plugins.dispatch(message, command_owner="personality")
+                else:
+                    self.plugins.dispatch(message)
 
     def _publish_group_events(self, events, session_id):
         if not self._connection_ready or self.backend is None or self.backend.session_id != session_id:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque, OrderedDict
 from concurrent.futures import TimeoutError as ControlTimeout
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 import hashlib
 import json
@@ -16,6 +16,9 @@ import threading
 import time
 
 from .config import ConfigStore, account_is_unbound, initialize_configs, validate_name
+from . import chat_export
+from .chat_archive import ChatArchive
+from .members import member_database_path
 from .locking import InstanceLock
 from .panel_common import PanelError as PanelError, redact as redact, redact_full
 from .panel_http import PanelHandler as PanelHandler, PanelServer as PanelServer
@@ -102,9 +105,12 @@ class PanelController:
         self.state, self.error, self.started = 'stopped', '', None
         self.stop_event, self.stopped_event = threading.Event(), threading.Event()
         self.logs = LogBuffer()
-        self.messages = MessageBuffer(sanitize=redact_full)
+        self.chat_archive = ChatArchive(self.workspace, read_json=read_json, write_json=atomic_json)
+        self.messages = MessageBuffer(sanitize=redact_full, archive=self.chat_archive)
         self.directory_cache = DirectoryCache(self.workspace)
         self.send_jobs = {}
+        from .windows_recovery import WindowsRecovery
+        self.recovery = WindowsRecovery(self)
         self.scheduled_tasks = ScheduledTasks(self, atomic_json, read_json)
         self.articles = Articles(self.workspace)
         self.article_sync = OfficialAccountSync()
@@ -162,12 +168,14 @@ class PanelController:
             config = self.store.load()
             changed_account = config.get('wechat_account') != wxid
             config.update(wechat_account=wxid, wechat_pid=None)
+            if changed_account:
+                config.pop('windows_auto_recovery', None)
             self._save_many({self.store.path: config})
             if changed_account:
                 self.messages.reset()
                 self.article_sync.clear()
 
-    def start(self):
+    def start(self, *, _replacement=None):
         with self.actions, self.lock:
             self._idle()
             lease = self.lock_factory(self.workspace / '.runtime/bot.lock')
@@ -182,8 +190,17 @@ class PanelController:
                     if not any(row['wxid'] == rows[0]['wxid'] and row['pid'] == rows[0]['pid'] for row in confirmed):
                         raise PanelError('账号状态已变化，请刷新后选择账号', 409)
                     config = self.store.bind_account(rows[0]['wxid'])
+                process = None
+                if _replacement is not None:
+                    if config.get('windows_auto_recovery', True) is not True:
+                        raise PanelError('该账号已关闭自动恢复', 409)
+                    process = self.recovery.validate_replacement(_replacement, config.get('wechat_account'))
                 app = self.factory(self.root, self.store)
                 app.config['console'] = False
+                if process is not None:
+                    account = config['wechat_account']
+                    app.config['wechat_pid'] = process.pid
+                    app._replacement_guard = lambda: self.recovery.matches_replacement(process, account)
                 def observe(message):
                     name = message.data.get('sender_wechat_name', '')
                     members = getattr(app, 'members', None)
@@ -212,6 +229,7 @@ class PanelController:
                             with self.lock:
                                 self.error = redact(error)
                         finally:
+                            self.chat_archive.flush()
                             lease.close()
                             with self.lock:
                                 self.state = 'error' if self.error else 'stopped'
@@ -220,6 +238,10 @@ class PanelController:
                 self.worker = threading.Thread(target=run, name='ManagedBot', daemon=False)
                 self.worker.start()
                 self.state = 'running'
+                try:
+                    self.recovery.arm(app, restored=process is not None)
+                except RuntimeError:
+                    self.recovery.status = 'failed'
                 try:
                     self.scheduled_tasks.start()
                 except Exception:
@@ -230,6 +252,7 @@ class PanelController:
 
     def stop(self):
         with self.lock:
+            self.recovery.cancel()
             if self.app is not None:
                 self.state = 'stopping'
                 self.app.stop_event.set()
@@ -251,14 +274,16 @@ class PanelController:
         self.start()
 
     def close(self):
+        self.stop_event.set()
+        self.recovery.cancel()
         self.scheduled_tasks.close()
         self.moments.close()
         self.moments_interactions.close()
-        self.stop_event.set()
         self.article_sync.clear()
         self.stop()
         if self.worker is not None:
             self.worker.join(15)
+        self.chat_archive.close()
         logging.getLogger().removeHandler(self.logs)
         self.stopped_event.set()
 
@@ -300,6 +325,7 @@ class PanelController:
                     'pid': getattr(getattr(self.app, 'backend', None), 'pid', None),
                     'started_at': self.started, 'error': self.error,
                     'connection_error': redact(self.app._last_connection_error) if self.app else '',
+                    'recovery_status': self.recovery.status,
                     'plugins': self.plugin_rows()}
 
     def configuration(self):
@@ -308,6 +334,7 @@ class PanelController:
         result = {'account': config.get('wechat_account') or '',
             'chat_allowlist': config.get('chat_allowlist', []),
             'text_send_delay': config.get('text_send_delay', {}),
+            'windows_auto_recovery': config.get('windows_auto_recovery', True),
             'plugins': config.get('plugins', {})}
         for name, path in paths.items():
             value = deepcopy(read_json(path))
@@ -329,6 +356,69 @@ class PanelController:
     def message_tail(self, after=0):
         return self.messages.tail(after)
 
+    def _chat_export_sources(self, *, expected_account=None, include_group_history=True):
+        with self.lock:
+            config = self.store.load()
+            account = config.get('wechat_account')
+            if account_is_unbound(account):
+                account = ''
+            if expected_account is not None and expected_account != account:
+                raise PanelError('当前微信账号已变化，请重新打开导出窗口', 409)
+            if not account:
+                return '', '', [], {}, None
+            stream, rows = self.messages.recorded(account)
+        names = {'filehelper': '文件传输助手'}
+        contacts = self.directory_cache.contacts(account) or {}
+        for contact in contacts.get('contacts', ()):
+            names[contact['wxid']] = contact['remark'] or contact['nickname'] or contact['alias']
+        names.update((group['chat_id'], group['name']) for group in self.directory_cache.groups(account)
+                     if group['name'])
+        for row in reversed(rows):
+            if not row['is_group'] and row['direction'] == 'incoming' and row['sender_name']:
+                names.setdefault(row['chat_id'], row['sender_name'])
+        path = self._paths(config).get('members')
+        database = None
+        if path is not None and path.is_file():
+            options = read_json(path)
+            names.update((chat, name) for chat, name in options.get('group_names', {}).items()
+                         if isinstance(name, str) and name)
+            if include_group_history:
+                database = member_database_path(path, options)
+        return account, stream, rows, names, database
+
+    def recorded_chats(self):
+        account, _, rows, names, path = self._chat_export_sources()
+        with chat_export.group_history(path) as db, self.chat_archive.reader() as archive:
+            return {'account': account, 'chats': chat_export.conversations(rows, db, archive, account, names),
+                    'archive': self.chat_archive.status(account)}
+
+    def configure_message_archive(self, data):
+        account, enabled = data.get('account'), data.get('enabled')
+        if not account or type(enabled) is not bool:
+            raise ValueError('归档设置需要当前微信账号和布尔开关')
+        with self.lock:
+            if self.store.load().get('wechat_account') != account or account_is_unbound(account):
+                raise PanelError('当前微信账号已变化，请重新打开导出窗口', 409)
+            self.messages.configure_archive(account, enabled)
+        if not enabled:
+            self.chat_archive.flush()
+        return self.chat_archive.status(account)
+
+    @contextmanager
+    def message_export(self, filters):
+        chat = validate_target(filters.get('chat_id'))
+        expected_account = filters.get('account')
+        if not expected_account:
+            raise ValueError('请先选择微信账号')
+        account, stream, rows, names, path = self._chat_export_sources(
+            expected_account=expected_account, include_group_history=chat.endswith('@chatroom'))
+        if not self.chat_archive.flush():
+            raise PanelError('有消息尚未写入本地归档，请检查磁盘空间和权限后重试', 503)
+        with ExitStack() as exported:
+            with chat_export.group_history(path) as db, self.chat_archive.reader() as archive:
+                download = exported.enter_context(chat_export.export_csv(stream, rows, db, archive, account, names, filters))
+            yield download
+
     def _save_many(self, changes):
         backup = self.workspace / '.runtime/web/backups' / str(time.time_ns())
         backup.mkdir(parents=True)
@@ -349,6 +439,13 @@ class PanelController:
         with self.actions, self.lock, self._editing():
             config = self.store.load()
             paths, changes = self._paths(config), {}
+            if 'windows_auto_recovery' in data:
+                account = config.get('wechat_account')
+                if account_is_unbound(account) or data.get('expected_account') != account:
+                    raise PanelError('自动恢复设置的账号已变化，请刷新后再保存', 409)
+                if type(data['windows_auto_recovery']) is not bool:
+                    raise PanelError('自动恢复开关必须为布尔值')
+                config['windows_auto_recovery'] = data['windows_auto_recovery']
             if 'chat_allowlist' in data:
                 values = data['chat_allowlist']
                 if not isinstance(values, list) or len(values) > 1000:
@@ -588,7 +685,12 @@ class PanelController:
                         snapshot.get('account') != account):
                     raise PanelError('联系人所属的微信账号已变化', 409)
                 self.directory_cache.save_contacts(account, snapshot)
-            return dict(snapshot, session_id=session)
+            result = dict(snapshot, session_id=session)
+            if 'friend.delete' in getattr(backend, 'capabilities', ()):
+                result['can_delete'] = True
+            if 'friend.relation.check' in getattr(backend, 'capabilities', ()):
+                result['can_scan_relations'] = True
+            return result
         return self._call(query)
 
     def _article_account(self, expected=None, *, required=False):
@@ -771,10 +873,10 @@ class PanelController:
                 raise PanelError('机器人或账号已停止', 409)
             allowed = list(app.config.get('chat_allowlist', []))
         def still_current():
-            with self.lock:
-                current = (self.app is app and self.state == 'running' and app._connection_ready and
-                           not app.stop_event.is_set() and getattr(app.backend, 'session_id', None) == session)
-            return bool(current and valid())
+            # Sending holds the service lock when it checks this guard.
+            # Reading the connection state here must not reacquire the panel lock.
+            return bool(valid() and self.app is app and self.state == 'running' and app._connection_ready and
+                        not app.stop_event.is_set() and getattr(app.backend, 'session_id', None) == session)
         return app.plugins.run_scheduled(action_id, params, session, allowed, still_current)
 
     def save_scheduled_task(self, data):
@@ -786,12 +888,43 @@ class PanelController:
     def toggle_scheduled_task(self, data):
         return self.scheduled_tasks.toggle(data)
 
+    def _send_busy(self, session):
+        return any(job['status'] == 'sending' and job['session_id'] == session and 'scan' not in job
+                   for job in self.send_jobs.values())
+
+    def _retire_old_send_jobs(self, session):
+        for job in self.send_jobs.values():
+            if job['status'] == 'sending' and job['session_id'] != session:
+                job.update(status='unknown', error='原发送连接已结束，请在微信核对结果')
+
+    def _trim_send_jobs(self):
+        while len(self.send_jobs) > 64:
+            expired = next((key for key, item in self.send_jobs.items() if item['status'] != 'sending'), None)
+            if expired is None:
+                return
+            del self.send_jobs[expired]
+
+    def _finish_send_job(self, job, status, error=''):
+        with self.lock:
+            if job['status'] == 'sending':
+                job.update(status=status, error=error)
+
+    def _start_send_job(self, job, deliver, name):
+        try:
+            threading.Thread(target=deliver, name=name, daemon=True).start()
+        except RuntimeError:
+            self._finish_send_job(job, 'failed', '操作任务未能启动，本次未提交')
+        return self.send_status(job['request_id'])
+
     def send_status(self, identifier):
         with self.lock:
             job = self.send_jobs.get(identifier)
             if job is None:
                 raise PanelError('发送记录已失效，请查看消息监控确认结果', 404)
-            return {key: job[key] for key in ('request_id', 'status', 'error')}
+            result = {key: job[key] for key in ('request_id', 'status', 'error')}
+            if 'scan' in job:
+                result['scan'] = {**job['scan'], 'rows': list(job['scan']['rows'])}
+            return result
 
     def send_text(self, data):
         """立即返回发送单号，等待节奏和原生回调在独立线程完成，HTTP 不重试发送。"""
@@ -818,7 +951,7 @@ class PanelController:
                 if previous['payload'] != payload:
                     raise PanelError('发送编号已使用，请重新提交', 409)
                 return self.send_status(identifier)
-            if any(job['status'] == 'sending' for job in self.send_jobs.values()):
+            if self._send_busy(session):
                 raise PanelError('上一条消息仍在发送，请等待结果', 409)
             app = self.app
             if app is None or not app._connection_ready or self.state == 'stopping':
@@ -828,10 +961,10 @@ class PanelController:
             allowed = app.config.get('chat_allowlist', [])
             if allowed and target not in allowed:
                 raise PanelError('该会话不在收发白名单中')
-            self.send_jobs[identifier] = {'request_id': identifier, 'payload': payload,
-                                          'status': 'sending', 'error': ''}
-            while len(self.send_jobs) > 64:
-                del self.send_jobs[next(iter(self.send_jobs))]
+            self._retire_old_send_jobs(session)
+            job = self.send_jobs[identifier] = dict(request_id=identifier, payload=payload,
+                                                    session_id=session, status='sending', error='')
+            self._trim_send_jobs()
 
         def deliver():
             try:
@@ -849,15 +982,13 @@ class PanelController:
                     result = app.service.send_text(target, content, expected_session=session)
                 if result is False:
                     raise RuntimeError('微信未确认发送')
+            except TimeoutError:
+                self._finish_send_job(job, 'unknown', '微信未返回可确认的发送结果，请查看微信和消息监控')
             except Exception:
-                # 不回显异常中的原生路径或请求内容，也不自动重发不确定的结果。
-                with self.lock:
-                    self.send_jobs[identifier].update(status='failed', error='发送未完成，请核对微信和消息监控后再决定是否重发')
+                self._finish_send_job(job, 'failed', '发送未完成，请核对微信和消息监控后再决定是否重发')
             else:
-                with self.lock:
-                    self.send_jobs[identifier].update(status='sent')
-        threading.Thread(target=deliver, name='PanelTextSend', daemon=True).start()
-        return self.send_status(identifier)
+                self._finish_send_job(job, 'sent')
+        return self._start_send_job(job, deliver, 'PanelTextSend')
 
     def send_friend_request(self, data):
         """Submit one account-bound request; duplicate request IDs never resend."""
@@ -875,7 +1006,7 @@ class PanelController:
                 if previous['payload'] != payload:
                     raise PanelError('发送编号已使用，请重新提交', 409)
                 return self.send_status(identifier)
-            if any(job['status'] == 'sending' for job in self.send_jobs.values()):
+            if self._send_busy(session):
                 raise PanelError('上一条请求仍在发送，请等待结果', 409)
             app = self.app
             if app is None or not app._connection_ready or self.state == 'stopping':
@@ -887,10 +1018,10 @@ class PanelController:
             allowed = app.config.get('chat_allowlist', [])
             if allowed and room and room not in allowed:
                 raise PanelError('来源群不在收发白名单中')
-            self.send_jobs[identifier] = {'request_id': identifier, 'payload': payload,
-                                          'status': 'sending', 'error': ''}
-            while len(self.send_jobs) > 64:
-                del self.send_jobs[next(iter(self.send_jobs))]
+            self._retire_old_send_jobs(session)
+            job = self.send_jobs[identifier] = dict(request_id=identifier, payload=payload,
+                                                    session_id=session, status='sending', error='')
+            self._trim_send_jobs()
         def deliver():
             try:
                 if app.service.send_friend_request(wxid, message, room=room, expected_session=session) is not True:
@@ -901,13 +1032,142 @@ class PanelController:
                                  "目标不在该群的已验证成员列表中", "来源群不在收发白名单中",
                                  "主动好友申请仅适配微信 4.2.0.12"}
                 detail = str(error) if str(error) in safe_messages else '申请未确认，请先核对微信，勿重复发送'
-                with self.lock:
-                    self.send_jobs[identifier].update(status='failed', error=detail)
+                self._finish_send_job(job, 'unknown' if isinstance(error, TimeoutError) else 'failed', detail)
             else:
+                self._finish_send_job(job, 'sent')
+        return self._start_send_job(job, deliver, 'PanelFriendAdd')
+
+    def delete_friend(self, data):
+        from .account import validate_account
+        from .friend_add import validate_friend_wxid
+
+        wxid = validate_friend_wxid(data.get('wxid'))
+        account = validate_account(data.get('account'))
+        identifier, session = data.get('request_id'), data.get('session_id')
+        if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', identifier):
+            raise PanelError('删除请求编号无效')
+        if not isinstance(session, str) or not session or len(session) > 80:
+            raise PanelError('请重新扫描联系人', 409)
+        if data.get('keep_history') is not True or wxid == account:
+            raise PanelError('请确认保留聊天记录并选择一位好友')
+        payload = ('friend_delete', account, session, wxid)
+        with self.lock:
+            previous = self.send_jobs.get(identifier)
+            if previous is not None:
+                if previous['payload'] != payload:
+                    raise PanelError('该请求编号已被使用', 409)
+                return self.send_status(identifier)
+            if self._send_busy(session):
+                raise PanelError('上一条请求仍在处理，请等待结果', 409)
+            if any(job['status'] == 'unknown' and job['payload'] == payload
+                   for job in self.send_jobs.values()):
+                raise PanelError('这个好友已有结果待核对的删除请求，请先在微信核对', 409)
+            app = self.app
+            if app is None or not app._connection_ready or self.state == 'stopping':
+                raise PanelError('请先启动并连接机器人', 409)
+            if (app.config.get('wechat_account') != account or
+                    not app.service.session_is_current(session)):
+                raise PanelError('微信账号或连接已变化，请重新扫描联系人', 409)
+            if 'friend.delete' not in getattr(app.backend, 'capabilities', ()):
+                raise PanelError('仅微信 4.2.0.12 支持删除好友', 409)
+            self._retire_old_send_jobs(session)
+            job = self.send_jobs[identifier] = dict(request_id=identifier, payload=payload,
+                                                    session_id=session, status='sending', error='')
+            self._trim_send_jobs()
+
+        def deliver():
+            status = 'unknown'
+            error = '微信未返回可确认的删除结果，请在微信核对'
+            try:
+                result = app.service.delete_friend(wxid, expected_session=session)
+                if result == 'deleted':
+                    status, error = 'deleted', ''
+                elif result == 'rejected':
+                    status, error = 'failed', '微信拒绝了这个删除请求'
+            except ValueError:
+                status, error = 'failed', '该联系人已不在当前账号的好友名单中'
+            except Exception:
+                pass
+            self._finish_send_job(job, status, error)
+
+        return self._start_send_job(job, deliver, 'PanelFriendDelete')
+
+    def scan_friend_relations(self, data):
+        from .account import validate_account
+
+        account = validate_account(data.get('account'))
+        identifier, session = data.get('request_id'), data.get('session_id')
+        if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', identifier):
+            raise PanelError('扫描请求编号无效')
+        if not isinstance(session, str) or not session or len(session) > 80:
+            raise PanelError('请重新扫描联系人', 409)
+        if data.get('confirm_wechat_effects') is not True:
+            raise PanelError('请确认微信可能生成系统提示或更新好友关系')
+        payload = ('friend_relations', account, session)
+        with self.lock:
+            previous = self.send_jobs.get(identifier)
+            if previous is not None:
+                if previous['payload'] != payload:
+                    raise PanelError('该请求编号已被使用', 409)
+                return self.send_status(identifier)
+            if any('scan' in job and job['status'] == 'sending' and job['session_id'] == session
+                   for job in self.send_jobs.values()):
+                raise PanelError('当前账号已有好友关系扫描在运行', 409)
+            app = self.app
+            if (app is None or not app._connection_ready or self.state != 'running' or
+                    app.config.get('wechat_account') != account or not app.service.session_is_current(session)):
+                raise PanelError('微信账号或连接已变化，请重新扫描联系人', 409)
+            if 'friend.relation.check' not in getattr(app.backend, 'capabilities', ()):
+                raise PanelError('仅微信 4.2.0.12 支持扫描好友关系', 409)
+            self._retire_old_send_jobs(session)
+            job = self.send_jobs[identifier] = dict(request_id=identifier, payload=payload, session_id=session,
+                status='sending', error='', scan={'total': None, 'checked': 0, 'unknown': 0, 'rows': []})
+            self._trim_send_jobs()
+
+        return self._start_send_job(job, lambda: self._scan_friend_relations(app, job, account, session),
+                                    'PanelFriendRelations')
+
+    def _scan_friend_relations(self, app, job, account, session):
+        def current():
+            return (job['status'] == 'sending' and self.app is app and self.state == 'running' and
+                    not self.stop_event.is_set() and app._connection_ready and
+                    getattr(app.backend, 'session_id', None) == session)
+
+        scan = job['scan']
+        try:
+            snapshot = app.service.contacts(expected_session=session)
+            if not snapshot or snapshot.get('account') != account or snapshot.get('session_id') != session:
+                raise RuntimeError('联系人缓存不可用')
+            contacts = snapshot['contacts']
+            with self.lock:
+                scan['total'] = len(contacts)
+            for index, contact in enumerate(contacts):
+                if index:
+                    time.sleep(0.8)
                 with self.lock:
-                    self.send_jobs[identifier].update(status='sent')
-        threading.Thread(target=deliver, name='PanelFriendAdd', daemon=True).start()
-        return self.send_status(identifier)
+                    if not current():
+                        raise RuntimeError('微信连接已结束')
+                try:
+                    status = app.service.check_friend_relation(contact['wxid'], expected_session=session)
+                except ValueError:
+                    status = 'unknown'
+                except (RuntimeError, OSError):
+                    with self.lock:
+                        scan['checked'] += 1
+                        scan['unknown'] += 1
+                    raise
+                with self.lock:
+                    if not current():
+                        raise RuntimeError('微信连接已结束')
+                    scan['checked'] += 1
+                    if status == 'verification_required':
+                        scan['rows'].append({key: contact[key] for key in ('wxid', 'nickname', 'remark')})
+                    elif status != 'accepted':
+                        scan['unknown'] += 1
+        except Exception:
+            self._finish_send_job(job, 'unknown', '扫描提前结束。已确认的结果保留，未检查的好友请稍后核对。')
+        else:
+            self._finish_send_job(job, 'scanned')
 
     def send_connection(self):
         def query(app):

@@ -18,6 +18,8 @@ function fixture(handler) {
     config:{account:'wxid_demo_a'},robotRows:[],busy:false,serviceAvailable:true,
     contactData:null,contactGeneration:0,contactLoading:false,contactError:'',contactIdentity:'',
     contactDetail:'',contactPage:0,contactSignature:'',contactPageSize:50,messageGeneration:0,
+    contactDeleteJob:null,contactDeleteStatus:'',confirm:()=>true,
+    crypto:{randomUUID:()=> 'fixture-contact-delete-01'},setTimeout:callback=>callback(),
     directoryLoadedKey:'',directoryPendingKey:'',directoryGroupsKey:'',directoryGeneration:0,directoryRetryAt:0,
     discoveredGroups:[],document:{activeElement:null},escape:s=>String(s??'').replaceAll('<','&lt;'),
     renderDiscoveredGroups(){},renderState(){}};
@@ -31,6 +33,61 @@ function directory(account='wxid_demo_a', name='演示好友') {
     contacts:[{wxid:'wxid_demo_peer',nickname:name,tag_ids:['7'],tags:['演示'],tags_status:'ready'}],
     tags:[{id:'7',name:'演示'}]}};
 }
+
+test('删除好友绑定当前账号和连接，确认后刷新，缓存模式禁用删除', async () => {
+  const calls=[];
+  const {scope,$}=fixture(async (route,body)=>{
+    calls.push([route,body]);
+    if(route==='directory-cache')return directory();
+    if(route==='friend-delete')return {status:'sending'};
+    if(route.startsWith('send-status?'))return {status:'deleted'};
+    if(route==='send-connection')return {session_id:'session-a'};
+    return {...directory().contacts,session_id:'session-a',can_delete:true,contacts:[]};
+  });
+  await scope.restoreDirectoryCache();
+  scope.state.connected=true;scope.contactDetail='wxid_demo_peer';scope.renderContacts();
+  assert.doesNotMatch($('#contact-list').innerHTML,/data-friend-delete/);
+  Object.assign(scope.contactData,{cached:false,can_delete:true,session_id:'session-a'});
+  scope.contactIdentity=scope.contactConnectionIdentity();
+  scope.renderContacts();assert.match($('#contact-list').innerHTML,/data-friend-delete/);
+  await scope.deleteContact('wxid_demo_peer');
+  const request=calls.find(([route])=>route==='friend-delete')[1];
+  assert.equal(request.wxid,'wxid_demo_peer');
+  assert.equal(request.account,'wxid_demo_a');
+  assert.equal(request.session_id,'session-a');
+  assert.equal(request.keep_history,true);
+  assert.equal(calls.filter(([route])=>route==='friend-delete').length,1);
+  assert.doesNotMatch($('#contact-list').innerHTML,/演示好友/);
+  assert.match($('#contact-status').textContent,/微信已确认删除好友/);
+});
+
+test('好友关系检测从当前账号启动并只渲染疑似名单', async () => {
+  const calls=[];
+  const {scope,$}=fixture(async (route,body,robot)=>{
+    calls.push([route,body,robot]);
+    if(route==='directory-cache')return directory();
+    if(route==='friend-relations')return {status:'sending'};
+    if(route.startsWith('send-status?'))return {status:'scanned',scan:{total:3,checked:3,unknown:1,
+      rows:[{wxid:'wxid_demo_match',nickname:'<示例>'}]}};
+  });
+  await scope.restoreDirectoryCache();
+  scope.state.connected=true;scope.renderContacts();
+  assert.equal($('#scan-friend-relations').disabled,true);
+  Object.assign(scope.contactData,{cached:false,can_scan_relations:true,session_id:'session-a'});
+  scope.contactIdentity=scope.contactConnectionIdentity();scope.renderContacts();
+  scope.confirm=()=>false;await scope.scanFriendRelations();
+  assert.equal(calls.length,1);
+  scope.confirm=()=>true;await scope.scanFriendRelations();
+  const scans=calls.filter(([route])=>route==='friend-relations');
+  assert.equal(scans.length,1);
+  assert.equal(scans[0][2],'a');
+  assert.equal(scans[0][1].account,'wxid_demo_a');
+  assert.equal(scans[0][1].session_id,'session-a');
+  assert.equal(scans[0][1].confirm_wechat_effects,true);
+  assert.match($('#friend-relations-status').textContent,/疑似 1 位 · 待核对 1 位/);
+  assert.match($('#friend-relations-list').innerHTML,/&lt;示例>/);
+  assert.doesNotMatch($('#friend-relations-list').innerHTML,/演示好友/);
+});
 
 test('未启动机器人即可恢复联系人和群，搜索可用，扫描仍禁用，读取会去重', async () => {
   const calls=[];

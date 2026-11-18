@@ -415,7 +415,7 @@ static DWORD start_impl(void* parameter) {
         return ERROR_NOT_SUPPORTED;
     core_base = reinterpret_cast<uintptr_t>(core);
     if (!wxbot_moments_candidate::anchors_match() || !anchors_match()) return ERROR_REVISION_MISMATCH;
-    if (_InterlockedCompareExchange(&live_tasks, 0, 0) || _InterlockedCompareExchange(&live_completions, 0, 0))
+    if (_InterlockedCompareExchange(&live_tasks, 0, 0) || text_reply_pending())
         return ERROR_BUSY;
     auto lease = std::make_shared<Lease>(cfg);
     auto ticket = std::make_shared<sns_task_lifetime::Ticket>();
@@ -428,7 +428,7 @@ static DWORD start_impl(void* parameter) {
     DWORD status = ERROR_GEN_FAILURE;
     try {
         auto marker = ticket->marker;
-        std::function<void()> task = [lease, marker] { (void)marker; on_start(lease); };
+        auto task = tracked_native_task([lease, marker] { (void)marker; on_start(lease); });
         status = sns_task_lifetime::schedule(ticket.get(), &task);
     } catch (...) {
         set_state(lease.get(), QUARANTINED);
@@ -459,7 +459,7 @@ static DWORD poll_impl(void* parameter) {
         DWORD status = ERROR_GEN_FAILURE;
         try {
             auto marker = ticket->marker;
-            std::function<void()> task = [lease, marker] { (void)marker; on_check(lease); };
+            auto task = tracked_native_task([lease, marker] { (void)marker; on_check(lease); });
             status = sns_task_lifetime::schedule(ticket.get(), &task);
         } catch (...) {
             set_state(lease.get(), QUARANTINED);
